@@ -406,6 +406,14 @@ config VIDEO_OS05B10
 	  To compile this driver as a module, choose M here: the
           module will be called os05b10.
 
+config VIDEO_PIXEL_CIS_BRINGUP
+	tristate "Pixel camera sensor power bring-up"
+	depends on I2C && OF
+	help
+	  Power a Google Pixel camera sensor through the sequence in its
+	  device tree node and read its ID registers. A bring-up aid until
+	  real sensor drivers exist.
+
 config VIDEO_OV01A10
 	tristate "OmniVision OV01A10 sensor support"
 	select V4L2_CCI_I2C
