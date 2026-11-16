@@ -432,3 +432,12 @@
 &dpu_fb_pool {
 	alignment = <0x0 0x00400000>;
 };
+
+/*
+ * The G3's Mali tops out at 890 MHz: the stock driver's dvfs_table on husky
+ * lists 150..890 MHz with exactly zumapro's G3D/G3DL2 pairs, but not the
+ * G4's 940/950 MHz level.
+ */
+&gpu_opp_table {
+	/delete-node/ opp-940000000;
+};
