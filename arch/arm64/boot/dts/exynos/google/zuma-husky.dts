@@ -764,3 +764,64 @@
 		};
 	};
 };
+
+/*
+ * Bluetooth: the BCM4398's BT core on the APM USI1 internal UART
+ * (serial_18), H4 with RTS/CTS. The UART has no pads of its own to mux:
+ * uart18-bus (gpa3) is not the BT link on husky (gpa3-0/1 are a bit-bang
+ * bus, gpa3-2 is ODPM vbatt), so serial_18 takes no pinctrl.
+ * Power and wake lines from the stock "goog,nitrous" node: BT_REG_ON
+ * gpn8-0, BT_DEV_WAKE gpn9-0, BT_HOST_WAKE gpn6-0. REG_ON reaches the
+ * chip through a flip-flop clocked by bt-ble-dbo-le (gpp24-3), which has
+ * to be pulsed after every REG_ON change (nitrous toggle_dbo_ff()).
+ * btbcm loads brcm/BCM.hcd, the patchram the stock HAL uses.
+ */
+&pinctrl_gpio_custom_alive {
+	bt_reg_on: bt-reg-on-pins {
+		samsung,pins = "gpn8-0";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+
+	bt_dev_wake: bt-dev-wake-pins {
+		samsung,pins = "gpn9-0";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+
+	bt_host_wake: bt-host-wake-pins {
+		samsung,pins = "gpn6-0";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_DOWN>;
+	};
+};
+
+&pinctrl_peric1 {
+	bt_reg_on_latch: bt-reg-on-latch-pins {
+		samsung,pins = "gpp24-3";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+};
+
+&usi18 {
+	samsung,clkreq-on; /* needed for UART mode */
+	status = "okay";
+};
+
+&serial_18 {
+	/delete-property/ pinctrl-0;
+	/delete-property/ pinctrl-names;
+	status = "okay";
+
+	bluetooth {
+		compatible = "brcm,bcm4390-bt";
+		pinctrl-0 = <&bt_reg_on &bt_dev_wake &bt_host_wake &bt_reg_on_latch>;
+		pinctrl-names = "default";
+		shutdown-gpios = <&gpn8 0 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&gpn9 0 GPIO_ACTIVE_HIGH>;
+		host-wakeup-gpios = <&gpn6 0 GPIO_ACTIVE_HIGH>;
+		reg-on-latch-gpios = <&gpp24 3 GPIO_ACTIVE_HIGH>;
+		max-speed = <3000000>;
+	};
+};
