@@ -81,50 +81,22 @@
 	};
 
 	/*
-	 * 6 GiB of the 12 GiB, the same range the Pixel 9 boards declare
-	 * (the bootloader also describes memory itself; this is a floor that
-	 * exists on every zuma/zumapro board). memory@80000000 comes from
-	 * zumapro.dtsi.
+	 * No memory nodes here beyond zumapro.dtsi's memory@80000000: the
+	 * bootloader adds memory@880000000 .. memory@a80000000 itself (as on
+	 * stock, whose base DTB only has memory@80000000), and fails the boot
+	 * when a node by that name already exists.
 	 */
-	memory@880000000 {
-		device_type = "memory";
-		reg = <0x08 0x80000000 0x80000000>;
-	};
-
-	memory@900000000 {
-		device_type = "memory";
-		reg = <0x09 0x00 0x80000000>;
-	};
-
-	memory@980000000 {
-		device_type = "memory";
-		reg = <0x09 0x80000000 0x80000000>;
-	};
-
-	/* The rest of the 12 GiB, as the bootloader reports it on husky. */
-	memory@a00000000 {
-		device_type = "memory";
-		reg = <0x0a 0x00 0x80000000>;
-	};
-
-	memory@a80000000 {
-		device_type = "memory";
-		reg = <0x0a 0x80000000 0x80000000>;
-	};
 
 	/*
 	 * Every hole the stock Android kernel leaves in low RAM on this phone
 	 * (Evolution X 17 / CP2A.260805.005, /proc/iomem and /sys/firmware/fdt
 	 * read back on a running husky) that zumapro.dtsi does not already
-	 * reserve. sec_dram and sec_pt belong to the secure world: mapping
-	 * them is an SError waiting to happen. The rest are kept out too
-	 * until each is understood; together it is about 300 MiB.
+	 * reserve and that the bootloader does not add by itself. It adds
+	 * sec_dram (0xb6200000), sec_pt (0xe0000000) and pkvm_guest_firmware
+	 * (0x8b000000) to /reserved-memory on every boot, and refuses the DTB
+	 * (reboots into fastboot) when they are already described here.
 	 */
 	reserved-memory {
-		pkvm_guest_firmware@8b000000 {
-			reg = <0x0 0x8b000000 0x000d0000>;
-			no-map;
-		};
 
 		gxp_scratchpad@91300000 {
 			reg = <0x0 0x91300000 0x000a0000>;
@@ -141,10 +113,6 @@
 			no-map;
 		};
 
-		sec_dram@b6200000 {
-			reg = <0x0 0xb6200000 0x09e00000>;
-			no-map;
-		};
 
 		carveout@d8100000 {
 			reg = <0x0 0xd8100000 0x02910000>;
@@ -156,10 +124,6 @@
 			no-map;
 		};
 
-		sec_pt@e0000000 {
-			reg = <0x0 0xe0000000 0x03800000>;
-			no-map;
-		};
 	};
 
 	gpio-keys {
@@ -328,4 +292,62 @@
 	vddh-usbdp-supply = <&reg_placeholder>;
 
 	status = "okay";
+};
+
+/*
+ * The bootloader merges its DPM (debug policy) overlay onto &dpm and reboots
+ * into fastboot when the base DTB has no such label: copied from the stock
+ * husky DTB (vendor_kernel_boot, B FOPLP). This DTB is built with -@ so the
+ * label is exported in /__symbols__.
+ */
+/ {
+	dpm: dpm {
+		version = <0x65>;
+		variant = "user";
+
+		security {
+			cp_mem_not_clear = <0x00>;
+			dbg_mem_enable = <0x00>;
+			seh_enable = <0x00>;
+			pm_test_enable = <0x00>;
+			seclog_enable = <0x00>;
+			harxlog_enable = <0x00>;
+			sdm_enable = <0x00>;
+			ERXPFG_enable = <0x00>;
+		};
+
+		abl {
+			ramdump_mode = <0x00>;
+			ramdump2usb = <0x00>;
+		};
+
+		feature {
+
+			dump-mode {
+				enabled = <0x01>;
+				file-support = <0x00>;
+			};
+
+			event {
+				method = "task_log", "work_log", "cpuidle_log", "suspend_log", "irq_log", "hrtimer_log", "clk_log", "pmu_log", "freq_log", "dm_log", "regulator_log", "thermal_log", "acpm_log", "printk_log";
+			};
+
+			debug-kinfo {
+				enabled = <0x01>;
+			};
+		};
+
+		policy {
+
+			exception {
+				pre_log = <0x01>;
+				el1_da = <0x00>;
+				el1_ia = <0x00>;
+				el1_undef = <0x00>;
+				el1_sp_pc = <0x00>;
+				el1_inv = <0x00>;
+				el1_serror = <0x00>;
+			};
+		};
+	};
 };
