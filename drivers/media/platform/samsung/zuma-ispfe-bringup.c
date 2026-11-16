@@ -5,10 +5,20 @@
  * vendor programming replayed from userspace. Not a media driver.
  *
  * sysfs: on (0/1). While on, the isp-fe registers are safe to access.
+ *
+ * After power-on the ISP-FE sub-blocks sit in reset and any access to them
+ * (e.g. +0x50000, version 0x1003aa) raises an SError. Android pulses the
+ * block reset first (+0x20008 = 0xf, +0x20010 = 1, wait for +0x2003c == 0);
+ * do the same. Offset 0 of the isp-fe window is a decode hole.
  */
+
+#define ISPFE_RST_SEL		0x20008
+#define ISPFE_RST_TRIG		0x20010
+#define ISPFE_RST_BUSY		0x2003c
 
 #include <linux/clk.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
@@ -20,9 +30,23 @@ struct ispfe_bringup {
 	struct clk_bulk_data *clks;
 	int nclks;
 	void __iomem *pmu;	/* ISPFE_CONFIGURATION/STATUS, read only */
+	void __iomem *ispfe;	/* isp-fe core, 0x1c300000 */
 	struct mutex lock;
 	bool on;
 };
+
+static int ispfe_reset(struct ispfe_bringup *p)
+{
+	u32 val;
+	int ret;
+
+	writel(0xf, p->ispfe + ISPFE_RST_SEL);
+	writel(1, p->ispfe + ISPFE_RST_TRIG);
+	ret = readl_poll_timeout(p->ispfe + ISPFE_RST_BUSY, val, !val, 10, 10000);
+	if (ret)
+		dev_err(p->dev, "ISP-FE reset stuck, %#x = %#x\n", ISPFE_RST_BUSY, val);
+	return ret;
+}
 
 static int ispfe_set(struct ispfe_bringup *p, bool on)
 {
@@ -41,6 +65,12 @@ static int ispfe_set(struct ispfe_bringup *p, bool on)
 			return ret;
 		ret = pm_runtime_resume_and_get(p->dev);
 		if (ret) {
+			clk_bulk_disable_unprepare(p->nclks, p->clks);
+			return ret;
+		}
+		ret = ispfe_reset(p);
+		if (ret) {
+			pm_runtime_put_sync(p->dev);
 			clk_bulk_disable_unprepare(p->nclks, p->clks);
 			return ret;
 		}
@@ -114,6 +144,13 @@ static int ispfe_probe(struct platform_device *pdev)
 	p->pmu = devm_ioremap(dev, res->start, resource_size(res));
 	if (!p->pmu)
 		dev_warn(dev, "PMU %pR not mapped, no status readback\n", res);
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return dev_err_probe(dev, -EINVAL, "no isp-fe window\n");
+	p->ispfe = devm_ioremap(dev, res->start, resource_size(res));
+	if (!p->ispfe)
+		return -ENOMEM;
 
 	platform_set_drvdata(pdev, p);
 	ret = devm_pm_runtime_enable(dev);
