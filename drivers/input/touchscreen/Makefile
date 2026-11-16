@@ -122,3 +122,4 @@ obj-$(CONFIG_TOUCHSCREEN_ZINITIX)	+= zinitix.o
 obj-$(CONFIG_TOUCHSCREEN_HIMAX_HX83112B)	+= himax_hx83112b.o
 obj-$(CONFIG_TOUCHSCREEN_TBN)		+= touch_bus_negotiator.o
 obj-$(CONFIG_TOUCHSCREEN_TBN_OPS)	+= tbn_ops.o
+obj-$(CONFIG_TOUCHSCREEN_ST_FTM5)	+= st-ftm5.o

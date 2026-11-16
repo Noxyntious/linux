@@ -1240,6 +1240,15 @@ config TOUCHSCREEN_ST1232
 	  To compile this driver as a module, choose M here: the
 	  module will be called st1232_ts.
 
+config TOUCHSCREEN_ST_FTM5
+	tristate "STMicroelectronics FTM5 touchscreen (SPI)"
+	depends on SPI
+	depends on OF
+	help
+	  Say Y here for the ST FTM5 touch controller on SPI, as found in the
+	  Google Pixel 8 Pro (husky). Minimal driver: runs the controller's
+	  flashed firmware and reports multi-touch; no firmware update.
+
 config TOUCHSCREEN_STMFTS
 	tristate "STMicroelectronics STMFTS touchscreen"
 	depends on I2C
