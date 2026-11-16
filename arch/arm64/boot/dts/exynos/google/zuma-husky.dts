@@ -1001,7 +1001,8 @@
 		sw3-supply = <&slg_gpio3>;
 		enable-gpios = <&s2mpg15_gpio 4 GPIO_ACTIVE_HIGH>;
 		clocks = <&cmu_top CLK_DOUT_CMU_CIS_CLK1>;
-		clock-frequency = <24000000>;
+		/* 24.576 MHz oscclk: no PLL here divides to exactly 24 MHz */
+		clock-frequency = <24576000>;
 		pinctrl-names = "mclk_on", "mclk_off";
 		pinctrl-0 = <&cam_front_mclk_on>;
 		pinctrl-1 = <&cam_front_mclk_off>;
@@ -1009,3 +1010,15 @@
 		pixel,reset-delay-us = <8000>;
 	};
 };
+
+/ {
+	/* Camera front end (CSIS + PDMA @0x1c000000) power, for bring-up. */
+	ispfe-bringup {
+		compatible = "google,zuma-ispfe-bringup";
+		power-domains = <&pd_ispfe>;
+		clocks = <&cmu_top CLK_DOUT_CMU_CSIS_BUS>,
+			 <&cmu_top CLK_DOUT_CMU_PDP_BUS>,
+			 <&cmu_top CLK_DOUT_CMU_IPP_BUS>;
+	};
+};
+
