@@ -23,6 +23,7 @@
 #include <linux/input.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 
@@ -42,6 +43,36 @@
 #define CS40L26_B2_DSP_HALO_STATE	0x02806af8
 #define CS40L26_B2_PM_CUR_STATE		0x02801f98
 #define CS40L26_DSP_HALO_STATE_RUN	2
+#define CS40L26_A1_PM_STATE_LOCKS	0x02800378
+#define CS40L26_DSP_LOCK3_OFFSET	8
+#define CS40L26_DSP_LOCK3		BIT(1)
+#define CS40L26_DSP_STATE_MASK		GENMASK(7, 0)
+#define CS40L26_DSP_STATE_SHUTDOWN	1
+#define CS40L26_DSP_STATE_STANDBY	2
+#define CS40L26_DSP_STATE_ACTIVE	3
+#define CS40L26_MBOX_PREVENT_HIBER	0x02000003
+
+/* Boost and errata registers (rev A1/B0/B1) */
+#define CS40L26_TEST_KEY_CTRL		0x40
+#define CS40L26_GLOBAL_ENABLES		0x2014
+#define CS40L26_GLOBAL_EN		BIT(0)
+#define CS40L26_ERROR_RELEASE		0x2034
+#define CS40L26_BST_SHORT_ERR		BIT(2)
+#define CS40L26_PLL_REFCLK_DETECT_0	0x2c28
+#define CS40L26_VBST_CTL_1		0x3800
+#define CS40L26_BST_CTL_MASK		GENMASK(7, 0)
+#define CS40L26_VBST_CTL_2		0x3804
+#define CS40L26_BST_CTL_SEL_MASK	GENMASK(1, 0)
+#define CS40L26_BST_CTL_LIM_EN		BIT(2)
+#define CS40L26_BST_IPK_CTL		0x3808
+#define CS40L26_TEST_LBST		0x391c
+#define CS40L26_DISABLE_EXPL_MODE	0x0100c080
+#define CS40L26_BST_UV_MIN		2500000
+#define CS40L26_BST_UV_MAX		11000000
+#define CS40L26_BST_UV_STEP		50000
+#define CS40L26_BST_IPK_UA_MIN		800000
+#define CS40L26_BST_IPK_UA_MAX		4800000
+#define CS40L26_BST_IPK_UA_STEP		50000
 
 #define CS40L26_ROM_INDEX_START		0x01800000
 #define CS40L26_ROM_NUM_WAVES		39
@@ -324,6 +355,192 @@ static int cs40l26_identify(struct cs40l26 *cs)
 	return 0;
 }
 
+static int cs40l26_update_bits(struct cs40l26 *cs, u32 reg, u32 mask, u32 val)
+{
+	u32 old;
+	int ret;
+
+	ret = cs40l26_read(cs, reg, &old);
+	if (ret)
+		return ret;
+	return cs40l26_write(cs, reg, (old & ~mask) | (val & mask));
+}
+
+/*
+ * Keep the chip out of hibernation. Hibernation drops register settings that
+ * are not in the DSP's power-on write sequence, and finding that sequence
+ * needs the RAM firmware's symbol table, which this driver does not load
+ * yet. Staying in standby keeps the boost limits and errata below in force.
+ */
+static int cs40l26_prevent_hibernate(struct cs40l26 *cs)
+{
+	u32 state, locks;
+	int i, ret;
+
+	for (i = 0; i < 10; i++) {
+		ret = cs40l26_mailbox(cs, CS40L26_MBOX_PREVENT_HIBER);
+		if (ret)
+			return ret;
+		ret = cs40l26_read(cs, CS40L26_A1_PM_CUR_STATE, &state);
+		if (ret)
+			return ret;
+		state &= CS40L26_DSP_STATE_MASK;
+		if (state == CS40L26_DSP_STATE_ACTIVE)
+			return 0;
+		if (state == CS40L26_DSP_STATE_STANDBY) {
+			ret = cs40l26_read(cs, CS40L26_A1_PM_STATE_LOCKS +
+					   CS40L26_DSP_LOCK3_OFFSET, &locks);
+			if (ret)
+				return ret;
+			if (locks & CS40L26_DSP_LOCK3)
+				return 0;
+		}
+		usleep_range(5000, 5100);
+	}
+	return -ETIMEDOUT;
+}
+
+/* Wait until the DSP is idle (not playing) before touching the boost. */
+static int cs40l26_wait_dsp_idle(struct cs40l26 *cs)
+{
+	u32 state = 0;
+	int i, ret;
+
+	for (i = 0; i < 20; i++) {
+		ret = cs40l26_read(cs, CS40L26_A1_PM_CUR_STATE, &state);
+		if (ret)
+			return ret;
+		state &= CS40L26_DSP_STATE_MASK;
+		if (state == CS40L26_DSP_STATE_STANDBY ||
+		    state == CS40L26_DSP_STATE_SHUTDOWN)
+			return 0;
+		usleep_range(20000, 20100);
+	}
+	dev_err(cs->dev, "DSP never went idle (state %u)\n", state);
+	return -EBUSY;
+}
+
+/*
+ * Boost converter short test, as the downstream driver runs it on rev A1
+ * parts: boost to VP in fixed mode, enable, and check for a short.
+ */
+static int cs40l26_lbst_short_test(struct cs40l26 *cs)
+{
+	u32 vbst1, vbst2, err;
+	int ret, ret2;
+
+	ret = cs40l26_read(cs, CS40L26_VBST_CTL_1, &vbst1);
+	if (!ret)
+		ret = cs40l26_read(cs, CS40L26_VBST_CTL_2, &vbst2);
+	if (!ret)
+		ret = cs40l26_update_bits(cs, CS40L26_VBST_CTL_1,
+					  CS40L26_BST_CTL_MASK, 0);	/* VP */
+	if (!ret)
+		ret = cs40l26_update_bits(cs, CS40L26_VBST_CTL_2,
+					  CS40L26_BST_CTL_SEL_MASK, 0);	/* fixed */
+	if (ret)
+		return ret;
+
+	ret = cs40l26_update_bits(cs, CS40L26_GLOBAL_ENABLES,
+				  CS40L26_GLOBAL_EN, CS40L26_GLOBAL_EN);
+	if (ret)
+		return ret;
+
+	usleep_range(10000, 10100);	/* boost converter powered up */
+
+	ret = cs40l26_read(cs, CS40L26_ERROR_RELEASE, &err);
+
+	ret2 = cs40l26_update_bits(cs, CS40L26_GLOBAL_ENABLES,
+				   CS40L26_GLOBAL_EN, 0);
+	if (ret)
+		return ret;
+	if (ret2)
+		return ret2;
+
+	if (err & CS40L26_BST_SHORT_ERR) {
+		dev_crit(cs->dev, "FATAL: boost shorted at startup, haptics disabled\n");
+		return -ENOTRECOVERABLE;
+	}
+
+	ret = cs40l26_write(cs, CS40L26_VBST_CTL_1, vbst1);
+	if (!ret)
+		ret = cs40l26_write(cs, CS40L26_VBST_CTL_2, vbst2);
+	return ret;
+}
+
+static int cs40l26_boost_config(struct cs40l26 *cs)
+{
+	u32 uv, ua, ctl, ipk;
+	int ret;
+
+	if (device_property_read_u32(cs->dev, "cirrus,bst-ctl-microvolt", &uv) ||
+	    uv < CS40L26_BST_UV_MIN || uv > CS40L26_BST_UV_MAX)
+		uv = CS40L26_BST_UV_MAX;
+	ctl = (uv - CS40L26_BST_UV_MIN) / CS40L26_BST_UV_STEP;
+
+	if (device_property_read_u32(cs->dev, "cirrus,bst-ipk-microamp", &ua) ||
+	    ua < CS40L26_BST_IPK_UA_MIN || ua > CS40L26_BST_IPK_UA_MAX)
+		ua = 4500000;
+	ipk = ua / CS40L26_BST_IPK_UA_STEP - 16;
+
+	ret = cs40l26_write(cs, CS40L26_VBST_CTL_1, ctl);
+	if (!ret)
+		ret = cs40l26_update_bits(cs, CS40L26_VBST_CTL_2,
+					  CS40L26_BST_CTL_LIM_EN,
+					  CS40L26_BST_CTL_LIM_EN);
+	if (!ret)
+		ret = cs40l26_write(cs, CS40L26_BST_IPK_CTL, ipk);
+	if (ret)
+		return ret;
+
+	dev_info(cs->dev, "boost %u mV, peak current %u mA\n",
+		 uv / 1000, ua / 1000);
+	return 0;
+}
+
+static int cs40l26_safety_init(struct cs40l26 *cs)
+{
+	static const struct reg_sequence a1_errata[] = {
+		{ CS40L26_PLL_REFCLK_DETECT_0, 0 },
+		{ CS40L26_TEST_KEY_CTRL, 0x55 },
+		{ CS40L26_TEST_KEY_CTRL, 0xaa },
+		{ CS40L26_TEST_LBST, CS40L26_DISABLE_EXPL_MODE },
+		{ CS40L26_TEST_KEY_CTRL, 0 },
+	};
+	bool expl_mode = !device_property_present(cs->dev,
+						  "cirrus,bst-expl-mode-disable");
+	int i, ret;
+
+	if (cs->revid >= CS40L26_REVID_B2) {
+		dev_warn(cs->dev, "rev %02X: no safety init for this revision yet\n",
+			 cs->revid);
+		return 0;
+	}
+
+	ret = cs40l26_prevent_hibernate(cs);
+	if (ret)
+		return dev_err_probe(cs->dev, ret, "cannot keep the DSP awake\n");
+
+	ret = cs40l26_wait_dsp_idle(cs);
+	if (ret)
+		return ret;
+
+	/* downstream: explicit boost mode skips the short test and errata */
+	if (!expl_mode) {
+		ret = cs40l26_lbst_short_test(cs);
+		if (ret)
+			return ret;
+	}
+
+	for (i = 0; i < (expl_mode ? 1 : ARRAY_SIZE(a1_errata)); i++) {
+		ret = cs40l26_write(cs, a1_errata[i].reg, a1_errata[i].def);
+		if (ret)
+			return ret;
+	}
+
+	return cs40l26_boost_config(cs);
+}
+
 static int cs40l26_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -356,6 +573,10 @@ static int cs40l26_probe(struct i2c_client *client)
 	}
 
 	ret = cs40l26_identify(cs);
+	if (ret)
+		return ret;
+
+	ret = cs40l26_safety_init(cs);
 	if (ret)
 		return ret;
 

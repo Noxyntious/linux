@@ -927,6 +927,10 @@
 		pinctrl-0 = <&hapt_amp_rst>;
 		pinctrl-names = "default";
 		reset-gpios = <&gph2 3 GPIO_ACTIVE_LOW>;
+		/* boost limits from the stock husky DT */
+		cirrus,bst-expl-mode-disable;
+		cirrus,bst-ctl-microvolt = <11000000>;
+		cirrus,bst-ipk-microamp = <2500000>;
 	};
 };
 
