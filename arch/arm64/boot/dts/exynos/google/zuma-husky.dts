@@ -417,6 +417,28 @@
 			};
 		};
 	};
+
+	/*
+	 * Sub PMIC (S2MPG15), only the AoC sensor rails. Enable-only, like on
+	 * the Pixel 9: the bootloader leaves the voltages where the AoC wants
+	 * them (stock husky overlay: L7S_SENSORS 1.8 V, L5S_PROX 3.3 V).
+	 * Same IRQ as on the Pixel 9 (gpa0-1).
+	 */
+	pmic-2 {
+		compatible = "samsung,s2mpg15-pmic";
+		interrupt-parent = <&gpa0>;
+		interrupts = <1 0 0>, <1 0 1>;
+
+		regulators {
+			s_ldo5_reg: ldo5s {
+				regulator-name = "L5S_PROX";
+			};
+
+			s_ldo7_reg: ldo7s {
+				regulator-name = "L7S_SENSORS";
+			};
+		};
+	};
 };
 
 /*
@@ -673,6 +695,13 @@
 	/* stock husky AOC node: aoc-board-cfg "HK3" */
 	aoc-board-id = <0x40202>;
 	aoc-board-rev = <0x10000>;
+
+	/*
+	 * The AoC does not power its physical sensors itself; without these it
+	 * enumerates only fused/software sensors (stock: sensor_power_list).
+	 */
+	sensor_1v8-supply = <&s_ldo7_reg>;
+	sensor_3v3-supply = <&s_ldo5_reg>;
 };
 
 / {
@@ -823,5 +852,17 @@
 		host-wakeup-gpios = <&gpn6 0 GPIO_ACTIVE_HIGH>;
 		reg-on-latch-gpios = <&gpp24 3 GPIO_ACTIVE_HIGH>;
 		max-speed = <3000000>;
+	};
+};
+
+/*
+ * Sensors live behind the AoC's USF sensor hub. aoc-usf uploads the stock
+ * registry scripts (google/usf/registry.manifest) stamped with the CDT from
+ * /chosen/plat, and usf-iio exposes the sensors as IIO devices.
+ */
+/ {
+	aoc_usf: aoc-usf {
+		compatible = "google,aoc-usf";
+		google,aoc = <&aoc>;
 	};
 };
