@@ -1978,6 +1978,9 @@ static const struct regulator_desc s2mpg15_regulators[] = {
 	/* AoC sensor rails; see s2mpg15_reg_enable_only_ops above */
 	regulator_desc_s2mpg15_ldo_en(5),
 	regulator_desc_s2mpg15_ldo_en(7),
+	/* L12S_CAMIO (1.85 V) and L26S_LDAF (3.3 V): camera sensor rails */
+	regulator_desc_s2mpg15_ldo_en(12),
+	regulator_desc_s2mpg15_ldo_en(26),
 };
 
 static int s2mps14_pmic_enable_ext_control(struct s2mps11_info *s2mps11,

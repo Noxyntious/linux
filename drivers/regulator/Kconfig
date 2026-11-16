@@ -1510,6 +1510,14 @@ config REGULATOR_SKY81452
 	  This driver can also be built as a module. If so, the module
 	  will be called sky81452-regulator.
 
+config REGULATOR_SLG51002
+	tristate "Dialog Semiconductor SLG51002 camera PMIC (enable-only)"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Switch the LDOs and load switches of the SLG51002 camera PMIC on
+	  the Pixel 8 Pro. Voltages are left as programmed.
+
 config REGULATOR_SLG51000
 	tristate "Dialog Semiconductor SLG51000 regulators"
 	depends on I2C
