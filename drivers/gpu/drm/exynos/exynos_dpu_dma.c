@@ -93,6 +93,11 @@
 #define IDMA_IMG_FORMAT_ARGB2101010 (19)
 
 #define IDMA_BLOCK_EN BIT(3)
+/* RDMA_IN_CTRL_0 rotation field (downstream cal_9865 regs-dpp.h) */
+#define IDMA_ROT(_v) ((_v) << 4)
+#define IDMA_ROT_MASK (0x7 << 4)
+#define IDMA_ROT_NONE 0
+#define IDMA_ROT_180 3	/* X and Y flip */
 
 #define IDMA_QOS_LUT_LOW 0x0130
 #define IDMA_QOS_LUT_HIGH 0x0134
@@ -346,6 +351,17 @@ int dpu_dma_update(struct exynos_dpu_dma_context *ctx, unsigned int idma,
 	dma_write_mask(ctx, idma, IDMA_IN_CON,
 		       IDMA_IMG_FORMAT(idma_img_format(fb->format->format)),
 		       IDMA_IMG_FORMAT_MASK);
+	/*
+	 * Always set the rotation field: the bootloader leaves IDMA channels
+	 * with a 180 degree read (seen on husky's IDMA5), and a plane that only
+	 * updates the format inherits it and comes out upside down.
+	 * google,scanout-rotate-180 is for a panel really mounted upside down;
+	 * it turns full-screen planes only (a smaller one would also need its
+	 * position mirrored).
+	 */
+	dma_write_mask(ctx, idma, IDMA_IN_CON,
+		       IDMA_ROT(ctx->rotate_180 ? IDMA_ROT_180 : IDMA_ROT_NONE),
+		       IDMA_ROT_MASK);
 
 	return 0;
 }
@@ -473,6 +489,9 @@ static int dpu_dma_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	platform_set_drvdata(pdev, ctx);
+
+	ctx->rotate_180 = of_property_read_bool(dev->of_node,
+						"google,scanout-rotate-180");
 
 	/*
 	 * Take the framebuffer pool if one is described.  Dumb buffers are

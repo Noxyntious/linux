@@ -8,6 +8,7 @@ struct exynos_dpu_dma_context {
 	int irq;
 	void __iomem *regs;
 	void *dma_priv;
+	bool rotate_180;	/* panel mounted upside down: flip every layer */
 };
 
 int dpu_dma_update(struct exynos_dpu_dma_context *ctx, unsigned int idma,
