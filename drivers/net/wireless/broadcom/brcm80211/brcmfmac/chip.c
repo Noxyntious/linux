@@ -781,6 +781,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
 	case BRCM_CC_4387_CHIP_ID:
 		return 0x740000;
 	case BRCM_CC_4390_CHIP_ID:
+	case BRCM_CC_4398_CHIP_ID:	/* stock bcmdhd: "ram ... at 0x2a0000" */
 		return 0x2a0000;
 	case BRCM_CC_4383_CHIP_ID:
 		/* CR4_4383_RAM_BASE in the vendor's bcmdhd (include/sbchipc.h):
@@ -827,6 +828,9 @@ int brcmf_chip_get_raminfo(struct brcmf_chip *pub)
 			 */
 			if (ci->pub.chip == BRCM_CC_4390_CHIP_ID)
 				ci->pub.ramsize = 0x320000;
+			/* BCM4398: stock bcmdhd reports 4194304 bytes */
+			if (ci->pub.chip == BRCM_CC_4398_CHIP_ID)
+				ci->pub.ramsize = 0x400000;
 		} else {
 			mem = brcmf_chip_get_core(&ci->pub,
 						  BCMA_CORE_INTERNAL_MEM);

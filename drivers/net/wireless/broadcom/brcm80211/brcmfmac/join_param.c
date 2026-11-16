@@ -292,6 +292,64 @@ brcmf_get_struct_for_connect_v3(struct brcmf_cfg80211_info *cfg,
 	return ext_v3;
 }
 
+/*
+ * Join version 2 (e.g. BCM4398 firmware 24.x, Pixel 8 Pro): bcmdhd's
+ * wl_extjoin_params_v2_t - the v1 scan block with ml_scan_mode, and assoc
+ * params carrying the 4-byte multi-link assoc/scan block (left zero).
+ */
+static void *
+brcmf_get_struct_for_connect_v2(struct brcmf_cfg80211_info *cfg,
+				u32 *struct_size,
+				struct cfg80211_connect_params *params)
+{
+	struct brcmf_ext_join_params_v2_le *ext_v2;
+	u32 join_params_size =
+		struct_size(ext_v2, assoc_le.chanspec_list, cfg->channel != 0);
+
+	*struct_size = join_params_size;
+	ext_v2 = kzalloc(join_params_size, GFP_KERNEL);
+	if (!ext_v2) {
+		bphy_err(cfg, "Could not allocate memory for extended join parameters\n");
+		return NULL;
+	}
+	ext_v2->version = cpu_to_le16(2);
+	ext_v2->assoc_le.version = cpu_to_le16(2);
+	brcmf_joinscan_set_ssid(&ext_v2->ssid_le, params->ssid, params->ssid_len);
+	/* same layout as the v0/v1 scan block, with ml_scan_mode = 0 */
+	brcmf_joinscan_set_common_v0v1_params(
+		(struct brcmf_join_scan_params_le *)&ext_v2->scan_le,
+		cfg->channel != 0);
+	brcmf_joinscan_set_bssid(ext_v2->assoc_le.bssid, params->bssid);
+	if (cfg->channel) {
+		struct ieee80211_channel *chan = params->channel_hint ?
+						 params->channel_hint :
+						 params->channel;
+		brcmf_joinscan_set_single_chanspec_from_channel(
+			cfg, chan, &ext_v2->assoc_le.chanspec_num,
+			&ext_v2->assoc_le.chanspec_list);
+	}
+	return ext_v2;
+}
+
+static void *brcmf_get_join_from_ext_join_v2(void *ext_join, u32 *struct_size)
+{
+	struct brcmf_ext_join_params_v2_le *ext_v2 = ext_join;
+	u32 chanspec_num = le32_to_cpu(ext_v2->assoc_le.chanspec_num);
+	struct brcmf_join_params_v2 *join_params;
+	u32 join_params_size =
+		struct_size(join_params, params_le.chanspec_list, chanspec_num);
+	u32 assoc_size = struct_size_t(struct brcmf_assoc_params_v2_le,
+				       chanspec_list, chanspec_num);
+
+	*struct_size = join_params_size;
+	join_params = kzalloc(join_params_size, GFP_KERNEL);
+	if (!join_params)
+		return NULL;
+	memcpy(&join_params->ssid_le, &ext_v2->ssid_le, sizeof(ext_v2->ssid_le));
+	memcpy(&join_params->params_le, &ext_v2->assoc_le, assoc_size);
+	return join_params;
+}
+
 static void *brcmf_get_join_from_ext_join_v3(void *ext_join, u32 *struct_size)
 {
 	struct brcmf_ext_join_params_v3_le *ext_v3 = ext_join;
@@ -330,6 +388,14 @@ int brcmf_join_param_setup_for_version(struct brcmf_pub *drvr, u8 version)
 			brcmf_get_struct_for_connect_v1;
 		drvr->join_param_handler.get_join_from_ext_join =
 			brcmf_get_join_from_ext_join_v1;
+		break;
+	case 2:
+		drvr->join_param_handler.get_struct_for_ibss =
+			brcmf_get_prepped_struct_for_ibss_v1;
+		drvr->join_param_handler.get_struct_for_connect =
+			brcmf_get_struct_for_connect_v2;
+		drvr->join_param_handler.get_join_from_ext_join =
+			brcmf_get_join_from_ext_join_v2;
 		break;
 	case 3:
 		drvr->join_param_handler.get_struct_for_ibss =

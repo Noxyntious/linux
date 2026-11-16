@@ -364,6 +364,8 @@ int brcmf_feat_attach(struct brcmf_pub *drvr)
 	if (!err) {
 		u16 ver = le16_to_cpu(join_ver.join_ver_major);
 		err = brcmf_join_param_setup_for_version(drvr, ver);
+		if (err)
+			bphy_err(drvr, "firmware join_ver %u not supported\n", ver);
 	} else {
 		/* Default to version 0, unless it is one of the firmware branches
 		 * that doesn't have a join_ver iovar but are still version 1 */
