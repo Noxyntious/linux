@@ -351,3 +351,23 @@
 		};
 	};
 };
+
+/*
+ * The boot framebuffer is scanned out by the bootloader's DECON through the
+ * DPUF read DMA. Nothing in this DT binds the display yet, so the DPU SysMMU
+ * and S2MPU runtime-suspend about a second into boot and genpd powers their
+ * domains off -- DECON stops fetching and the panel freezes on whatever it
+ * showed last (and touching 0x19840000 afterwards hangs the bus). Keep the
+ * display domains up until a real display driver owns them.
+ */
+&pd_dpub {
+	samsung,always-on;
+};
+
+&pd_dpuf0 {
+	samsung,always-on;
+};
+
+&pd_dpuf1 {
+	samsung,always-on;
+};

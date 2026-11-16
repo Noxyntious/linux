@@ -376,6 +376,15 @@ static int __init zumapro_bootfb_early(char *arg)
 	bootfb.pd.format = bootfb.format_guessed ?
 		(bpp == 2 ? "r5g6b5" : "x8r8g8b8") :
 		bootfb_formats[fmt].simplefb_name;
+	/*
+	 * Tensor G3 (zuma): the husky bootloader also leaves IDMA format 0,
+	 * but the panel shows it as ARGB8888 -- white drawn as BGRX came out
+	 * yellow (blue lost). Describe it as such; a8r8g8b8 rather than
+	 * x8r8g8b8 so the unused byte is written as 0xff, never transparent.
+	 */
+	if (fmt == 0 && (of_flat_dt_is_compatible(of_get_flat_dt_root(), "google,zuma") ||
+			 of_flat_dt_is_compatible(of_get_flat_dt_root(), "google,ZUMA")))
+		bootfb.pd.format = "a8r8g8b8";
 
 	if (!memblock_is_memory(bootfb.fb_base)) {
 		pr_info("framebuffer %pa is outside RAM, giving up\n",
