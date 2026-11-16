@@ -246,6 +246,10 @@ static const struct iio_chan_spec usf_prox_channels[] = {
 static const struct iio_chan_spec usf_pressure_channels[] = {
 	USF_SCALAR_CHANNELS(IIO_PRESSURE),
 };
+/* a part's own die temperature: one plain channel */
+static const struct iio_chan_spec usf_die_temp_channels[] = {
+	USF_SCALAR_CHANNELS(IIO_TEMP),
+};
 /*
  * A thermopile measures two things: the temperature of whatever it is pointed
  * at, and its own, which the object reading is derived against. IIO has
@@ -324,6 +328,14 @@ static const struct usf_type_map {
 	  ARRAY_SIZE(usf_temp_channels), 2, usf_scan_masks_2axis, 1000000000000ULL },
 	{ "MLX90632 FIR Temperature", "usf_irtemp", usf_temp_channels,
 	  ARRAY_SIZE(usf_temp_channels), 2, usf_scan_masks_2axis, 1000000000000ULL },
+	/*
+	 * Die temperatures of the Pixel 8 Pro's light/prox and pressure parts,
+	 * matched on the full names for the same reason as above.
+	 */
+	{ "TMD3719 Temperature", "usf_temp_alsp", usf_die_temp_channels,
+	  ARRAY_SIZE(usf_die_temp_channels), 1, usf_scan_masks_scalar, 1000000000000ULL },
+	{ "ICP20100 Temperature", "usf_temp_baro", usf_die_temp_channels,
+	  ARRAY_SIZE(usf_die_temp_channels), 1, usf_scan_masks_scalar, 1000000000000ULL },
 };
 
 static int usf_start_sampling(struct usf_sensor *s);
