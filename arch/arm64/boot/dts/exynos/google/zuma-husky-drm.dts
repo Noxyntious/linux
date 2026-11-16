@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Pixel 8 Pro (husky) with the display handed to exynos DRM (DECON0 -> DPP0
+ * -> DSIM0 -> hk3 panel) instead of zumapro-bootfb's simple framebuffer.
+ *
+ * Needs the kernel booted WITHOUT zumapro_bootfb and with exynos DRM's DECON
+ * quiesce left on (husky-drm.config): enabling the DPU SysMMU (dpu_dma iommus)
+ * under the bootloader's still-fetching DECON resets the SoC.
+ *
+ * Panel: reset on gpa6-0, TE on gpp0-3 (downstream zuma-shusky-display.dtsi,
+ * zuma-drm-dpu.dtsi). The rails (vci m_ldo14, vddi s_bucka, vddd m_ldo22) are
+ * left as the bootloader set them; no PMIC is described yet.
+ */
+
+#include "zuma-husky.dts"
+
+/ {
+	model = "Google Pixel 8 Pro (DRM display)";
+};
+
+&decon0 {
+	status = "okay";
+};
+
+&dpu_dma {
+	status = "okay";
+};
+
+&dpp0 {
+	status = "okay";
+};
+
+&dsim0 {
+	status = "okay";
+
+	panel0: panel@0 {
+		compatible = "google,hk3-panel";
+		reg = <0>;
+		reset-gpios = <&gpa6 0 GPIO_ACTIVE_HIGH>;
+
+		port {
+			panel0_in: endpoint {
+				remote-endpoint = <&dsim0_out>;
+			};
+		};
+	};
+
+	ports {
+		port@1 {
+			reg = <1>;
+			dsim0_out: endpoint {
+				remote-endpoint = <&panel0_in>;
+			};
+		};
+	};
+};

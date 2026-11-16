@@ -8,7 +8,9 @@ dtb-$(CONFIG_ARCH_EXYNOS) += \
 	zumapro-caiman.dtb \
 	zumapro-comet.dtb \
 	zumapro-komodo.dtb \
-	zuma-husky.dtb
+	zuma-husky.dtb \
+	zuma-husky-drm.dtb
 
 # The Pixel bootloader applies overlays by label (DPM): export symbols.
 DTC_FLAGS_zuma-husky := -@
+DTC_FLAGS_zuma-husky-drm := -@

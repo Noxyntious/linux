@@ -422,3 +422,13 @@
 &{/thermal-zones/big-thermal/cooling-maps/map0} {
 	cooling-device = <&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 };
+
+/*
+ * /reserved-memory has #address-cells = <2>, so "alignment" takes two cells;
+ * zumapro.dtsi's single cell makes the kernel reject the pool ("invalid
+ * alignment property in 'dpu-fb-pool'") and the DRM framebuffer allocation
+ * then fails.
+ */
+&dpu_fb_pool {
+	alignment = <0x0 0x00400000>;
+};

@@ -425,6 +425,19 @@ config DRM_PANEL_GOOGLE_CAIMAN
 	  the active refresh rate (60 or 120 Hz), and exposes DCS brightness
 	  control, so the exynos9 DECON can take over scanning out.
 
+config DRM_PANEL_GOOGLE_HK3
+	tristate "Google Pixel 8 Pro (husky) hk3 boot-handoff panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	select DRM_DISPLAY_DSC_HELPER
+	select DRM_DISPLAY_HELPER
+	help
+	  Say Y here to enable the boot-handoff panel driver for the hk3
+	  1344x2992 command-mode OLED of the Google Pixel 8 Pro (husky). The
+	  bootloader powers and initialises the panel; the driver programs DSC,
+	  TE and brightness and leaves power alone.
+
 config DRM_PANEL_GOOGLE_KOMODO
 	tristate "Google Pixel 9 Pro XL (komodo) boot-handoff panel"
 	depends on OF
