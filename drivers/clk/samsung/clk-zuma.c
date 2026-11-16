@@ -1308,16 +1308,22 @@ PNAME(mout_apm_funcsrc_p)	= { "pll_alv_div2_apm", "pll_alv_div4_apm",
 				    "pll_alv_div16_apm" };
 
 static const struct samsung_fixed_rate_clock apm_fixed_clks[] __initconst = {
-	FRATE(CLK_APM_PLL_DIV2_APM, "pll_alv_div2_apm", NULL, 0, 400000000),
-	FRATE(CLK_APM_PLL_DIV4_APM, "pll_alv_div4_apm", NULL, 0, 200000000),
-	FRATE(CLK_APM_PLL_DIV16_APM, "pll_alv_div16_apm", NULL, 0, 50000000),
+	/* PLL_ALV is 786.432 MHz (measured via the APM USI1 UART on husky) */
+	FRATE(CLK_APM_PLL_DIV2_APM, "pll_alv_div2_apm", NULL, 0, 393216000),
+	FRATE(CLK_APM_PLL_DIV4_APM, "pll_alv_div4_apm", NULL, 0, 196608000),
+	FRATE(CLK_APM_PLL_DIV16_APM, "pll_alv_div16_apm", NULL, 0, 49152000),
 };
 
 static const struct samsung_mux_clock apm_mux_clks[] __initconst = {
+	/*
+	 * SELECT is bits [1:0] like every other CLK_CON_MUX: on husky the
+	 * bootloader leaves APM_FUNC=1 (funcsrc), which the old 4/3 shifts
+	 * misread as oscclk - APM USI1 UART then ran 16x too fast.
+	 */
 	MUX(CLK_MOUT_APM_FUNC, "mout_apm_func", mout_apm_func_p,
-	    CLK_CON_MUX_MUX_CLKCMU_APM_FUNC, 4, 1),
+	    CLK_CON_MUX_MUX_CLKCMU_APM_FUNC, 0, 2),
 	MUX(CLK_MOUT_APM_FUNCSRC, "mout_apm_funcsrc", mout_apm_funcsrc_p,
-	    CLK_CON_MUX_MUX_CLKCMU_APM_FUNCSRC, 3, 1),
+	    CLK_CON_MUX_MUX_CLKCMU_APM_FUNCSRC, 0, 2),
 };
 
 static const struct samsung_div_clock apm_div_clks[] __initconst = {
