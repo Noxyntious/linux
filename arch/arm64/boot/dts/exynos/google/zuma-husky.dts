@@ -101,6 +101,67 @@
 		reg = <0x09 0x80000000 0x80000000>;
 	};
 
+	/* The rest of the 12 GiB, as the bootloader reports it on husky. */
+	memory@a00000000 {
+		device_type = "memory";
+		reg = <0x0a 0x00 0x80000000>;
+	};
+
+	memory@a80000000 {
+		device_type = "memory";
+		reg = <0x0a 0x80000000 0x80000000>;
+	};
+
+	/*
+	 * Every hole the stock Android kernel leaves in low RAM on this phone
+	 * (Evolution X 17 / CP2A.260805.005, /proc/iomem and /sys/firmware/fdt
+	 * read back on a running husky) that zumapro.dtsi does not already
+	 * reserve. sec_dram and sec_pt belong to the secure world: mapping
+	 * them is an SError waiting to happen. The rest are kept out too
+	 * until each is understood; together it is about 300 MiB.
+	 */
+	reserved-memory {
+		pkvm_guest_firmware@8b000000 {
+			reg = <0x0 0x8b000000 0x000d0000>;
+			no-map;
+		};
+
+		gxp_scratchpad@91300000 {
+			reg = <0x0 0x91300000 0x000a0000>;
+			no-map;
+		};
+
+		gxp@91400000 {
+			reg = <0x0 0x91400000 0x01000000>;
+			no-map;
+		};
+
+		carveout@97000000 {
+			reg = <0x0 0x97000000 0x00400000>;
+			no-map;
+		};
+
+		sec_dram@b6200000 {
+			reg = <0x0 0xb6200000 0x09e00000>;
+			no-map;
+		};
+
+		carveout@d8100000 {
+			reg = <0x0 0xd8100000 0x02910000>;
+			no-map;
+		};
+
+		carveout@dda10000 {
+			reg = <0x0 0xdda10000 0x00610000>;
+			no-map;
+		};
+
+		sec_pt@e0000000 {
+			reg = <0x0 0xe0000000 0x03800000>;
+			no-map;
+		};
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 		pinctrl-0 = <&key_voldown>, <&key_volup>, <&key_power>;
