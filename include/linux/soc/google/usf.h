@@ -157,4 +157,15 @@ int usf_session_reconfig(struct usf_session *s, u32 handle, u32 sampling_id,
 int usf_session_stop_sampling(struct usf_session *s, u32 handle,
 			      u32 sampling_id);
 
+/**
+ * usf_session_display_info() - tell the AoC the panel state
+ *
+ * The under-display ALS/proximity sensor stays silent until the AoC's
+ * display-info server has been told the panel is on, at what refresh and TE2
+ * rate. The stock HAL resends this on every brightness or state change.
+ */
+struct usf_display_info;
+int usf_session_display_info(struct usf_session *s,
+			     const struct usf_display_info *di);
+
 #endif /* _SOC_GOOGLE_USF_H_ */

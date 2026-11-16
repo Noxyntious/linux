@@ -19,6 +19,7 @@
 extern const u8 usf_uuid_sensor_mgr[16];
 extern const u8 usf_uuid_sample_channel[16];
 extern const u8 usf_uuid_registry[16];
+extern const u8 usf_uuid_display_info[16];
 
 /* UsfMsg.body operation code (msg_id). */
 enum usf_msg_id {
@@ -31,6 +32,7 @@ enum usf_msg_id {
 	USF_MSG_REGISTRY_GET    = 21,
 	USF_MSG_REGISTRY_SET    = 22,
 	USF_MSG_REGISTRY_LOAD_SCRIPT = 24,
+	USF_MSG_DISPLAY_INFO    = 1001,
 };
 
 /* Outer envelope type (UsfMsgOuter.type). */
@@ -122,6 +124,19 @@ int usf_build_reconfig(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 		       bool enable, const u8 **out, size_t *out_len);
 int usf_build_stop_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
 			    u32 sampling_id, const u8 **out, size_t *out_len);
+struct usf_display_info {
+	u32 brightness;
+	u8 state;		/* 1 = on */
+	u32 refresh_hz;
+	u32 te2_hz;
+	u32 leakage_bits;	/* f32 bits, ALS leakage term */
+	u32 luma_bits;		/* f32 bits, ALS luma term */
+	u64 timestamp_ns;
+};
+
+int usf_build_display_info(struct usf_fbb *b, u32 txn, u32 dst,
+			   const struct usf_display_info *di,
+			   const u8 **out, size_t *out_len);
 int usf_build_load_script(struct usf_fbb *b, u32 txn, u32 reg_handle,
 			  const u8 *script, size_t script_len, u32 cdt,
 			  const u8 **out, size_t *out_len);

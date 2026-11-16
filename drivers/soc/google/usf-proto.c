@@ -32,6 +32,10 @@ const u8 usf_uuid_registry[16] = {
 	0xd7, 0x6a, 0x14, 0xcc, 0x26, 0x4d, 0xee, 0xa1,
 	0xc6, 0x40, 0x6f, 0x8b, 0x46, 0x16, 0x82, 0xc0,
 };
+const u8 usf_uuid_display_info[16] = {
+	0xa8, 0x8e, 0xc6, 0x24, 0x10, 0x40, 0x2a, 0xed,
+	0xca, 0xb9, 0xa5, 0xaa, 0xd6, 0xa2, 0xee, 0xd2,
+};
 
 /* ------------------------------------------------------------------ *
  * FlatBuffer builder (back-to-front, per the flatbuffers reference)   *
@@ -215,6 +219,18 @@ static u32 fbb_create_bytes(struct usf_fbb *b, const void *data, u32 n)
 	return (u32)b->used;
 }
 
+
+/* Create a vector of 32-bit scalars (here: IEEE floats as raw bits). */
+static u32 fbb_create_u32_vec(struct usf_fbb *b, const u32 *v, u32 n)
+{
+	u32 i;
+
+	fbb_align(b, 4);
+	for (i = n; i > 0; i--)
+		fbb_push_u32(b, v[i - 1]);
+	fbb_push_u32(b, n);
+	return (u32)b->used;
+}
 
 /*
  * Create a vector of table offsets; returns its location.  Elements are pushed
@@ -431,6 +447,52 @@ int usf_build_stop_sampling(struct usf_fbb *b, u32 txn, u32 sensor_handle,
  * FlatBuffer reader (schemaless, field-id based)                      *
  * ------------------------------------------------------------------ */
 
+
+/*
+ * DisplayInfo (msg 1001) to the display-info server. Layout from a capture of
+ * the stock HAL (usf::DisplayInfoService::SendInfoReq) on the Pixel 8 Pro:
+ *   fid0 u32 brightness (backlight level)   fid1 u8 panel state (1 = on)
+ *   fid2 u32 refresh rate (Hz)               fid4 f32 / fid11 [f32] ALS luma
+ *   fid5 f32 / fid10 [f32 x3] ALS leakage    fid6 u32 TE2 rate (Hz)
+ *   fid8 u8 0xff                             fid9 u8 2 (constant in Finish())
+ *   fid13 u64 AP timestamp (ns)
+ * The TMD3719 under the OLED measures in step with TE2, so the AoC holds its
+ * ALS/proximity outputs back until it has been told the panel is on.
+ */
+int usf_build_display_info(struct usf_fbb *b, u32 txn, u32 dst,
+			   const struct usf_display_info *di,
+			   const u8 **out, size_t *out_len)
+{
+	const u32 leak[3] = { di->leakage_bits, 0, 0 };
+	const u32 luma[1] = { di->luma_bits };
+	const u8 *body;
+	size_t blen;
+	u32 v_leak, v_luma, bt;
+
+	fbb_init(b);
+	v_leak = fbb_create_u32_vec(b, leak, ARRAY_SIZE(leak));
+	v_luma = fbb_create_u32_vec(b, luma, ARRAY_SIZE(luma));
+	fbb_start_table(b);
+	fbb_add_i64(b, 13, di->timestamp_ns);
+	fbb_add_offset(b, 11, v_luma);
+	fbb_add_offset(b, 10, v_leak);
+	fbb_add_i32(b, 5, di->leakage_bits);
+	if (di->luma_bits)
+		fbb_add_i32(b, 4, di->luma_bits);
+	fbb_add_i32(b, 0, di->brightness);
+	fbb_add_i32(b, 2, di->refresh_hz);
+	fbb_add_i32(b, 6, di->te2_hz);
+	fbb_add_bool(b, 1, di->state);
+	fbb_add_bool(b, 8, 0xff);
+	fbb_add_bool(b, 9, 2);
+	bt = fbb_end_table(b);
+	fbb_finish(b, bt, &body, &blen);
+	if (b->overflow || blen > b->cap)
+		return -EOVERFLOW;
+	memcpy(b->scratch_body, body, blen);
+	return build_request(b, USF_MSG_DISPLAY_INFO, txn, dst,
+			     b->scratch_body, blen, out, out_len);
+}
 
 int usf_build_load_script(struct usf_fbb *b, u32 txn, u32 reg_handle,
 			  const u8 *script, size_t script_len, u32 cdt,
