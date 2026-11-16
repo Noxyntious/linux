@@ -46,6 +46,12 @@ properties:
       reset the BT module. This should be marked as
       GPIO_ACTIVE_LOW.
 
+  reg-on-latch-gpios:
+    maxItems: 1
+    description: GPIO clocking a flip-flop that latches BT_REG_ON on boards
+      where the shutdown line does not reach the module directly; it is
+      pulsed after every change of the shutdown line.
+
   device-wakeup-gpios:
     maxItems: 1
     description: GPIO specifier for the line BT_WAKE used to

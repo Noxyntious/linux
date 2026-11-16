@@ -6,6 +6,7 @@
  *  Copyright (C) 2015  Intel Corporation
  */
 
+#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/skbuff.h>
@@ -120,6 +121,7 @@ struct bcm_device {
 	struct gpio_desc	*device_wakeup;
 	struct gpio_desc	*shutdown;
 	struct gpio_desc	*reset;
+	struct gpio_desc	*reg_on_latch;
 	int			(*set_device_wakeup)(struct bcm_device *, bool);
 	int			(*set_shutdown)(struct bcm_device *, bool);
 #ifdef CONFIG_ACPI
@@ -1056,6 +1058,15 @@ static int bcm_gpio_set_shutdown(struct bcm_device *dev, bool powered)
 		 * description.
 		 */
 		gpiod_set_value_cansleep(dev->reset, !powered);
+	if (dev->reg_on_latch) {
+		/*
+		 * Some boards (Pixel 8 Pro) feed BT_REG_ON through a
+		 * flip-flop: clock the new level in with a short pulse.
+		 */
+		gpiod_set_value_cansleep(dev->reg_on_latch, 1);
+		udelay(1);
+		gpiod_set_value_cansleep(dev->reg_on_latch, 0);
+	}
 	return 0;
 }
 
@@ -1117,6 +1128,11 @@ static int bcm_get_resources(struct bcm_device *dev)
 					     GPIOD_OUT_LOW);
 	if (IS_ERR(dev->reset))
 		return PTR_ERR(dev->reset);
+
+	dev->reg_on_latch = devm_gpiod_get_optional(dev->dev, "reg-on-latch",
+						    GPIOD_OUT_LOW);
+	if (IS_ERR(dev->reg_on_latch))
+		return PTR_ERR(dev->reg_on_latch);
 
 	dev->set_device_wakeup = bcm_gpio_set_device_wakeup;
 	dev->set_shutdown = bcm_gpio_set_shutdown;
