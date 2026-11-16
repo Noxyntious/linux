@@ -603,7 +603,7 @@
  * Wi-Fi: BCM4398 (rev 3 "d0", PCIe 14e4:4444) on PCIe channel 1. Pins from
  * the husky live DT: PERST gph3-0, CLKREQ gph3-1, WL_REG_ON gph3-4,
  * WL_DEV_WAKE gph3-5, WL_HOST_WAKE gpa5-1 (the Pixel 9a's is gpa5-3).
- * Stock runs the link at Gen3; start at Gen2 as the Pixel 9a port does.
+ * Gen3, as stock runs it.
  */
 &pinctrl_hsi2 {
 	wlan_pcie1_clkreq: wlan-pcie1-clkreq-pins {
@@ -656,7 +656,7 @@
 	wlan-reg-on-gpios = <&gph3 4 GPIO_ACTIVE_HIGH>;		/* WLAN_EN */
 	host-wake-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;		/* WL_HOST_WAKE */
 	device-wake-gpios = <&gph3 5 GPIO_ACTIVE_HIGH>;		/* WL_DEV_WAKE */
-	max-link-speed = <2>;
+	max-link-speed = <3>;
 	status = "okay";
 };
 
