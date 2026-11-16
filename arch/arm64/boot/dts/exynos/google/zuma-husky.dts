@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Pixel 8 Pro (husky), Tensor G3 (zuma). First bring-up DT.
+ *
+ * Deliberately minimal: storage (UFS), USB gadget, keys and the watchdogs,
+ * with the bootloader's framebuffer taken over by zumapro-bootfb (it reads
+ * DECON back, so it needs no address here; pass "zumapro_bootfb" on the
+ * command line). No PMIC, charger, panel or touch driver is bound yet, so
+ * no regulator can be switched off behind the bootloader's back: every rail
+ * a consumer needs is a fixed placeholder that is assumed to be on.
+ *
+ * Board facts from downstream kernel/devices/google/shusky
+ * (android-gs-shusky-6.1-android16): zuma-husky-mp.dts board_id 0x40206,
+ * zuma-shusky-usb.dtsi (eUSB2 repeater at 0x3e on hsi2c_11 and its tune
+ * values), zuma-ufs.dtsi (UFS VCC enable on gpp0-1).
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include "zumapro-pinctrl.h"
+#include "zuma.dtsi"
+
+/ {
+	model = "Google Pixel 8 Pro";
+	compatible = "google,husky", "google,zuma";
+
+	/*
+	 * Read by the bootloader (not the kernel) to pick a DTB out of
+	 * vendor_kernel_boot: zuma is product 0x9865, B0/B1 steppings, and
+	 * IPOP (pkg_mode 1) or FOPLP (0) packages. Copied from downstream
+	 * zuma-b0-ipop.dts / zuma-b0-foplp.dts so any retail unit matches.
+	 */
+	soc_compatible {
+		B0_IPOP {
+			description = "B0,IPOP";
+			product_id = <0x09865>;
+			major = <0x1>;
+			minor = <0x0>;
+			pkg_mode = <0x1>;
+		};
+
+		B1_IPOP {
+			description = "B1,IPOP";
+			product_id = <0x09865>;
+			major = <0x1>;
+			minor = <0x1>;
+			pkg_mode = <0x1>;
+		};
+
+		B0_FOPLP {
+			description = "B0,FOPLP";
+			product_id = <0x09865>;
+			major = <0x1>;
+			minor = <0x0>;
+			pkg_mode = <0x0>;
+		};
+
+		B1_FOPLP {
+			description = "B1,FOPLP";
+			product_id = <0x09865>;
+			major = <0x1>;
+			minor = <0x1>;
+			pkg_mode = <0x0>;
+		};
+	};
+
+	aliases {
+		serial0 = &serial_0;
+	};
+
+	chosen {
+		/*
+		 * The bootloader crashes when /chosen/bootargs is absent, and it
+		 * appends the boot image's command line to whatever is here, so
+		 * keep it present and empty.
+		 */
+		bootargs = "";
+		stdout-path = &serial_0;
+	};
+
+	/*
+	 * 6 GiB of the 12 GiB, the same range the Pixel 9 boards declare
+	 * (the bootloader also describes memory itself; this is a floor that
+	 * exists on every zuma/zumapro board). memory@80000000 comes from
+	 * zumapro.dtsi.
+	 */
+	memory@880000000 {
+		device_type = "memory";
+		reg = <0x08 0x80000000 0x80000000>;
+	};
+
+	memory@900000000 {
+		device_type = "memory";
+		reg = <0x09 0x00 0x80000000>;
+	};
+
+	memory@980000000 {
+		device_type = "memory";
+		reg = <0x09 0x80000000 0x80000000>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-0 = <&key_voldown>, <&key_volup>, <&key_power>;
+		pinctrl-names = "default";
+
+		button-vol-down {
+			label = "KEY_VOLUMEDOWN";
+			linux,code = <KEY_VOLUMEDOWN>;
+			gpios = <&gpa4 1 GPIO_ACTIVE_LOW>;
+		};
+
+		button-vol-up {
+			label = "KEY_VOLUMEUP";
+			linux,code = <KEY_VOLUMEUP>;
+			gpios = <&gpa6 2 GPIO_ACTIVE_LOW>;
+		};
+
+		button-power {
+			label = "KEY_POWER";
+			linux,code = <KEY_POWER>;
+			gpios = <&gpa4 0 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	reg_placeholder: regulator-0 {
+		compatible = "regulator-fixed";
+		regulator-name = "placeholder_reg";
+		regulator-always-on;
+	};
+
+	ufs_0_fixed_vcc_reg: regulator-1 {
+		compatible = "regulator-fixed";
+		regulator-name = "ufs-vcc";
+		gpio = <&gpp0 1 GPIO_ACTIVE_HIGH>;
+		regulator-boot-on;
+		/* nothing claims it, so only always-on stops the unused sweep */
+		regulator-always-on;
+		enable-active-high;
+	};
+};
+
+/* The DSU covers all nine cores. */
+&{/pmu-3} {
+	cpus = <&cpu0>, <&cpu1>, <&cpu2>, <&cpu3>,
+	       <&cpu4>, <&cpu5>, <&cpu6>, <&cpu7>, <&cpu8>;
+};
+
+&pinctrl_gpio_alive {
+	key_power: key-power-pins {
+		samsung,pins = "gpa4-0";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_UP>;
+	};
+
+	key_voldown: key-voldown-pins {
+		samsung,pins = "gpa4-1";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+
+	key_volup: key-volup-pins {
+		samsung,pins = "gpa6-2";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+};
+
+&ext_24_5m {
+	clock-frequency = <24576000>;
+};
+
+&ext_200m {
+	clock-frequency = <200000000>;
+};
+
+&ext_26m {
+	clock-frequency = <26000000>;
+};
+
+&ext_1m {
+	clock-frequency = <1000000>;
+};
+
+&serial_0 {
+	status = "okay";
+};
+
+&watchdog_cl0 {
+	timeout-sec = <30>;
+	status = "okay";
+};
+
+&watchdog_cl1 {
+	timeout-sec = <30>;
+	status = "okay";
+};
+
+&ufs_0 {
+	vcc-supply = <&ufs_0_fixed_vcc_reg>;
+	vdd-hba-supply = <&reg_placeholder>;
+	vccq-supply = <&reg_placeholder>;
+	vccq2-supply = <&reg_placeholder>;
+	vcc-max-microamp = <0>;
+	vccq-max-microamp = <0>;
+	vccq2-max-microamp = <0>;
+
+	status = "okay";
+};
+
+&ufs_0_phy {
+	status = "okay";
+};
+
+/* eUSB2 repeater: husky has it on hsi2c_11 (komodo: hsi2c_9). */
+&usi11 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_11 {
+	status = "okay";
+
+	eusb_repeater: eusb-repeater@3e {
+		compatible = "samsung,eusb-repeater";
+		reg = <0x3e>;
+		#phy-cells = <0>;
+		vdd33-supply = <&reg_placeholder>;
+		/* zuma-shusky-usb.dtsi repeater_tune1..8 (register, value) */
+		samsung,tune-param = <0x50 0x0a>,
+				     <0x70 0x3c>,
+				     <0x71 0x2c>,
+				     <0x72 0x90>,
+				     <0x73 0x83>,
+				     <0x77 0x00>,
+				     <0x78 0x0b>,
+				     <0x79 0x40>;
+	};
+};
+
+/*
+ * Peripheral only for now: the role switch normally comes from the
+ * MAX77759 TCPC, which is not described yet.
+ */
+&usbdrd31 {
+	vdd10-supply = <&reg_placeholder>;
+	vdd33-supply = <&reg_placeholder>;
+
+	status = "okay";
+};
+
+&usbdrd31_dwc3 {
+	dr_mode = "peripheral";
+	maximum-speed = "high-speed";
+
+	status = "okay";
+};
+
+&usbdrd31_phy {
+	pll-supply = <&reg_placeholder>;
+	dvdd-usb20-supply = <&reg_placeholder>;
+	vddh-usb20-supply = <&reg_placeholder>;
+	vdd33-usb20-supply = <&reg_placeholder>;
+	vdda-usbdp-supply = <&reg_placeholder>;
+	vddh-usbdp-supply = <&reg_placeholder>;
+
+	status = "okay";
+};

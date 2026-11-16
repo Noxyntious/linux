@@ -7,4 +7,5 @@ dtb-$(CONFIG_ARCH_EXYNOS) += \
 	zumapro-tokay.dtb \
 	zumapro-caiman.dtb \
 	zumapro-comet.dtb \
-	zumapro-komodo.dtb
+	zumapro-komodo.dtb \
+	zuma-husky.dtb

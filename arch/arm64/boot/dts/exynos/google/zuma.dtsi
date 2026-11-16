@@ -1,0 +1,148 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Google Tensor G3 (zuma) SoC, described as deltas on Tensor G4 (zumapro).
+ *
+ * Google's own downstream trees show how close the two are: of 572 SoC nodes
+ * in kernel/devices/google/zuma (android-gs-shusky-6.1-android16) and
+ * kernel/devices/google/zumapro (android-gs-caimito-6.1-android16), 567 share
+ * name and unit address; interrupt numbers (dt-bindings zuma.h vs zumapro.h)
+ * do not differ in value; and the caimito kernel drives its clocks from the
+ * very same cal-if/zuma tables as shusky. So everything below is what the G3
+ * really does differently:
+ *
+ *  - 9 CPUs in one DSU cluster (4x Cortex-A510, 4x Cortex-A715, 1x Cortex-X3)
+ *    instead of 8 (MPIDR 0x000..0x800, as downstream zuma-cpu.dtsi);
+ *  - so the GIC redistributor region covers 9 frames (downstream: 0x200000);
+ *  - one PMU interrupt for all cores, as downstream (no PPI partitions);
+ *  - the bootloader's own carveout at 0xf8800000.
+ *
+ * CPU DVFS and cpuidle are left out until they are checked against the G3:
+ * the zumapro OPP tables are G4 numbers, and the cores run at whatever the
+ * bootloader left them at, which is enough to boot.
+ */
+
+#include "zumapro.dtsi"
+
+/ {
+	cpus {
+		/delete-node/ cpu-map;
+
+		cpu-map {
+			cluster0 {
+				core0 { cpu = <&cpu0>; };
+				core1 { cpu = <&cpu1>; };
+				core2 { cpu = <&cpu2>; };
+				core3 { cpu = <&cpu3>; };
+				core4 { cpu = <&cpu4>; };
+				core5 { cpu = <&cpu5>; };
+				core6 { cpu = <&cpu6>; };
+				core7 { cpu = <&cpu7>; };
+				core8 { cpu = <&cpu8>; };
+			};
+		};
+
+		cpu8: cpu@800 {
+			#cooling-cells = <2>;
+			device_type = "cpu";
+			compatible = "arm,cortex-x3";
+			reg = <0x0800>;
+			enable-method = "psci";
+			capacity-dmips-mhz = <1024>;
+		};
+	};
+
+	/delete-node/ pmu-0;
+	/delete-node/ pmu-1;
+	/delete-node/ pmu-2;
+
+	pmu-g3 {
+		compatible = "arm,armv8-pmuv3";
+		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_HIGH 0>;
+	};
+
+	reserved-memory {
+		abl_reserved: abl@f8800000 {
+			reg = <0x0 0xf8800000 0x02000000>;
+			no-map;
+		};
+	};
+};
+
+&cpu0 {
+	compatible = "arm,cortex-a510";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <449>;
+};
+
+&cpu1 {
+	compatible = "arm,cortex-a510";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <449>;
+};
+
+&cpu2 {
+	compatible = "arm,cortex-a510";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <449>;
+};
+
+&cpu3 {
+	compatible = "arm,cortex-a510";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <449>;
+};
+
+&cpu4 {
+	compatible = "arm,cortex-a715";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <850>;
+};
+
+&cpu5 {
+	compatible = "arm,cortex-a715";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <850>;
+};
+
+&cpu6 {
+	compatible = "arm,cortex-a715";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <850>;
+};
+
+&cpu7 {
+	compatible = "arm,cortex-a715";
+	/delete-property/ clocks;
+	/delete-property/ operating-points-v2;
+	/delete-property/ cpu-idle-states;
+	/delete-property/ dynamic-power-coefficient;
+	capacity-dmips-mhz = <850>;
+};
+
+&gic {
+	reg = <0x10400000 0x10000>,	/* GICD */
+	      <0x10440000 0x200000>;	/* GICR, 9 frames (downstream size) */
+
+	/delete-node/ ppi-partitions;
+};

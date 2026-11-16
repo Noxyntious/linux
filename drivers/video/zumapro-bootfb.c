@@ -195,6 +195,13 @@ static int bootfb_probe_stage __initdata = -1;
 static const char * const zumapro_dt_compat[] __initconst = {
 	"google,zumapro",
 	"google,ZUMA PRO",
+	/*
+	 * Tensor G3 (Pixel 8). Same cal_9865 display block and addresses;
+	 * stock husky's dtbo rewrites the root to "google,ZUMA HUSKY",
+	 * "google,ZUMA".
+	 */
+	"google,zuma",
+	"google,ZUMA",
 };
 
 static bool __init zumapro_dt_root_matches(void)
