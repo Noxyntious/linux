@@ -38,6 +38,7 @@
 #include <linux/soc/google/aoc.h>
 
 #include <linux/soc/google/usf.h>
+#include <linux/soc/google/usf-proto.h>
 
 /*
  * Bootstrap retry cadence.  The fast phase covers the ordinary case, where the
@@ -103,6 +104,9 @@ struct usf_iio {
 	int nsensors;
 	spinlock_t sample_lock;	/* fences sample push/lookup vs buffer teardown */
 	bool ts_logged;		/* one-shot log of the first timestamp mapping */
+
+	/* Panel state last sent to the AoC (gates the under-display ALS/prox). */
+	struct usf_display_info disp;
 };
 
 /* Per-IIO-device state (in iio_priv). */
@@ -802,6 +806,16 @@ static void usf_enumerate(struct usf_iio *usf)
 			 filtered ? " matching " : "", filtered ? sensor : "");
 }
 
+/* ALS leakage term the stock HAL sends for this panel (86.02, from a capture). */
+#define USF_DISP_LEAKAGE_BITS	0x42ac0b07
+
+static int usf_send_display_info(struct usf_iio *usf)
+{
+	usf->disp.leakage_bits = USF_DISP_LEAKAGE_BITS;
+	usf->disp.timestamp_ns = ktime_get_boottime_ns();
+	return usf_session_display_info(usf->usf, &usf->disp);
+}
+
 /* Reschedule the bootstrap if we have retries left; otherwise give up. */
 static bool usf_retry(struct usf_iio *usf, const char *why)
 {
@@ -868,7 +882,40 @@ static void usf_iio_enumerate_work(struct work_struct *work)
 	usf->enumerated = true;
 
 	usf_enumerate(usf);
+	usf_send_display_info(usf);
 }
+
+static ssize_t display_info_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct usf_iio *usf = dev_get_drvdata(dev);
+	u32 bl, state, hz, te2;
+	int ret;
+
+	if (sscanf(buf, "%u %u %u %u", &bl, &state, &hz, &te2) != 4)
+		return -EINVAL;
+	if (!usf->enumerated)
+		return -EAGAIN;
+
+	usf->disp.brightness = bl;
+	usf->disp.state = state;
+	usf->disp.refresh_hz = hz;
+	usf->disp.te2_hz = te2;
+	ret = usf_send_display_info(usf);
+	return ret ? ret : count;
+}
+
+static ssize_t display_info_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct usf_iio *usf = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u %u %u %u\n", usf->disp.brightness,
+			  usf->disp.state, usf->disp.refresh_hz,
+			  usf->disp.te2_hz);
+}
+static DEVICE_ATTR_RW(display_info);
 
 static ssize_t enumerate_store(struct device *dev,
 			       struct device_attribute *attr,
@@ -891,6 +938,7 @@ static DEVICE_ATTR_WO(enumerate);
 
 static struct attribute *usf_iio_attrs[] = {
 	&dev_attr_enumerate.attr,
+	&dev_attr_display_info.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(usf_iio);
@@ -945,6 +993,17 @@ static int usf_iio_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&usf->stream_lock);
+	/*
+	 * Until something tracks the panel: on, mid brightness, and the 60 Hz
+	 * the mainline hk3 driver runs at. The rates must match the panel's
+	 * real TE2: told 120 Hz while TE2 ticks at 60, the AoC delivers one
+	 * ALS sample and then nothing (and no proximity at all). Userspace
+	 * updates this through the display_info attribute.
+	 */
+	usf->disp.brightness = 200;
+	usf->disp.state = 1;
+	usf->disp.refresh_hz = 60;
+	usf->disp.te2_hz = 60;
 	spin_lock_init(&usf->sample_lock);
 	INIT_DELAYED_WORK(&usf->enum_work, usf_iio_enumerate_work);
 	platform_set_drvdata(pdev, usf);
