@@ -8,6 +8,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
@@ -18,6 +19,7 @@ struct ispfe_bringup {
 	struct device *dev;
 	struct clk_bulk_data *clks;
 	int nclks;
+	void __iomem *pmu;	/* ISPFE_CONFIGURATION/STATUS, read only */
 	struct mutex lock;
 	bool on;
 };
@@ -29,21 +31,27 @@ static int ispfe_set(struct ispfe_bringup *p, bool on)
 	if (on == p->on)
 		return 0;
 
+	/*
+	 * CMU_TOP's ISPFE_NOC clock feeds the block's bus interface, so it
+	 * has to run before the domain comes up and stay up until it is down.
+	 */
 	if (on) {
-		ret = pm_runtime_resume_and_get(p->dev);
+		ret = clk_bulk_prepare_enable(p->nclks, p->clks);
 		if (ret)
 			return ret;
-		ret = clk_bulk_prepare_enable(p->nclks, p->clks);
+		ret = pm_runtime_resume_and_get(p->dev);
 		if (ret) {
-			pm_runtime_put(p->dev);
+			clk_bulk_disable_unprepare(p->nclks, p->clks);
 			return ret;
 		}
 	} else {
+		pm_runtime_put_sync(p->dev);
 		clk_bulk_disable_unprepare(p->nclks, p->clks);
-		pm_runtime_put(p->dev);
 	}
 	p->on = on;
-	dev_info(p->dev, "ISP-FE %s\n", on ? "on" : "off");
+	dev_info(p->dev, "ISP-FE %s, PMU status %#x, clk %lu Hz\n",
+		 on ? "on" : "off", p->pmu ? readl(p->pmu + 4) : ~0U,
+		 p->nclks ? clk_get_rate(p->clks[0].clk) : 0);
 	return 0;
 }
 
@@ -84,6 +92,7 @@ static int ispfe_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct ispfe_bringup *p;
+	struct resource *res;
 	int ret;
 
 	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
@@ -95,6 +104,16 @@ static int ispfe_probe(struct platform_device *pdev)
 	p->nclks = devm_clk_bulk_get_all(dev, &p->clks);
 	if (p->nclks < 0)
 		return dev_err_probe(dev, p->nclks, "clocks\n");
+	if (!p->nclks)
+		return dev_err_probe(dev, -EINVAL, "no ISPFE_NOC clock\n");
+
+	/* Shared with pd_ispfe: map without claiming the region. */
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -EINVAL;
+	p->pmu = devm_ioremap(dev, res->start, resource_size(res));
+	if (!p->pmu)
+		dev_warn(dev, "PMU %pR not mapped, no status readback\n", res);
 
 	platform_set_drvdata(pdev, p);
 	ret = devm_pm_runtime_enable(dev);

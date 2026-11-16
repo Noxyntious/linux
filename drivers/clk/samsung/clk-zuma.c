@@ -17,7 +17,7 @@
 #include "clk-pll.h"
 
 /* NOTE: Must be equal to the last clock ID increased by one */
-#define CLKS_NR_TOP	(CLK_GOUT_CMU_HSI0_DPOSC + 1)
+#define CLKS_NR_TOP	(CLK_GOUT_CMU_ISPFE_NOC + 1)
 #define CLKS_NR_APM	(CLK_APM_PLL_DIV16_APM + 1)
 #define CLKS_NR_DPU	(CLK_MOUT_DPU_DSIM_USER + 1)
 #define CLKS_NR_HSI0	(CLK_DOUT_HSI0_USB + 1)
@@ -112,6 +112,14 @@
 #define CLK_CON_MUX_MUX_CLKCMU_CPUCL0_SWITCH		0x1040
 #define CLK_CON_MUX_MUX_CLKCMU_CPUCL1_SWITCH		0x1048
 #define CLK_CON_MUX_MUX_CLKCMU_CPUCL2_SWITCH		0x104c
+/*
+ * Tensor G3 (zuma) only. Several G4 camera-bus names above sit at offsets
+ * that are other clocks on G3 (e.g. 0x20d0 is HSI1_PCIE there). The G3
+ * ISPFE block is fed by CLKCMU_ISPFE_NOC (vendor cal-if/zuma/cmucal-sfr.c).
+ */
+#define G3_CLK_CON_MUX_MUX_CLKCMU_ISPFE_NOC		0x10bc
+#define G3_CLK_CON_DIV_CLKCMU_ISPFE_NOC			0x18b4
+#define G3_CLK_CON_GAT_GATE_CLKCMU_ISPFE_NOC		0x20e4
 #define CLK_CON_MUX_MUX_CLKCMU_CSIS_BUS			0x104c
 #define CLK_CON_MUX_MUX_CLKCMU_DISP_BUS			0x1050
 #define CLK_CON_MUX_MUX_CLKCMU_DNS_BUS			0x1054
@@ -559,6 +567,12 @@ PNAME(mout_cmu_mcsc_itsc_p)	= { "dout_cmu_shared0_div3", "fout_shared3_pll",
 				    "dout_cmu_shared1_div4",
 				    "dout_cmu_shared2_div2",
 				    "fout_spare_pll", "oscclk" };
+PNAME(mout_cmu_ispfe_noc_p)	= { "dout_cmu_shared0_div3", "fout_shared3_pll",
+				    "dout_cmu_shared1_div3",
+				    "dout_cmu_shared0_div4",
+				    "dout_cmu_shared1_div4",
+				    "dout_cmu_shared2_div2", "fout_spare_pll",
+				    "oscclk" };
 PNAME(mout_cmu_mcsc_mcsc_p)	= { "dout_cmu_shared0_div3", "fout_shared3_pll",
 				    "dout_cmu_shared1_div3",
 				    "dout_cmu_shared0_div4",
@@ -775,6 +789,8 @@ static const struct samsung_mux_clock top_mux_clks[] __initconst = {
 	    CLK_CON_MUX_MUX_CLKCMU_ITP_BUS, 0, 3),
 	MUX(CLK_MOUT_CMU_MCSC_ITSC, "mout_cmu_mcsc_itsc", mout_cmu_mcsc_itsc_p,
 	    CLK_CON_MUX_MUX_CLKCMU_MCSC_ITSC, 0, 3),
+	MUX(CLK_MOUT_CMU_ISPFE_NOC, "mout_cmu_ispfe_noc", mout_cmu_ispfe_noc_p,
+	    G3_CLK_CON_MUX_MUX_CLKCMU_ISPFE_NOC, 0, 3),
 	MUX(CLK_MOUT_CMU_MCSC_MCSC, "mout_cmu_mcsc_mcsc", mout_cmu_mcsc_mcsc_p,
 	    CLK_CON_MUX_MUX_CLKCMU_MCSC_MCSC, 0, 3),
 	MUX(CLK_MOUT_CMU_MFC_MFC, "mout_cmu_mfc_mfc", mout_cmu_mfc_mfc_p,
@@ -909,6 +925,8 @@ static const struct samsung_div_clock top_div_clks[] __initconst = {
 	    CLK_CON_DIV_CLKCMU_ITP_BUS, 0, 4),
 	DIV(CLK_DOUT_CMU_MCSC_ITSC, "dout_cmu_mcsc_itsc", "gout_cmu_mcsc_itsc",
 	    CLK_CON_DIV_CLKCMU_MCSC_ITSC, 0, 4),
+	DIV(CLK_DOUT_CMU_ISPFE_NOC, "dout_cmu_ispfe_noc", "gout_cmu_ispfe_noc",
+	    G3_CLK_CON_DIV_CLKCMU_ISPFE_NOC, 0, 4),
 	DIV(CLK_DOUT_CMU_MCSC_MCSC, "dout_cmu_mcsc_mcsc", "gout_cmu_mcsc_mcsc",
 	    CLK_CON_DIV_CLKCMU_MCSC_MCSC, 0, 4),
 	DIV(CLK_DOUT_CMU_MFC_MFC, "dout_cmu_mfc_mfc", "gout_cmu_mfc_mfc",
@@ -1099,6 +1117,8 @@ static const struct samsung_gate_clock top_gate_clks[] __initconst = {
 	     CLK_CON_GAT_GATE_CLKCMU_ITP_BUS, 21, 0, 0),
 	GATE(CLK_GOUT_CMU_MCSC_ITSC, "gout_cmu_mcsc_itsc", "mout_cmu_mcsc_itsc",
 	     CLK_CON_GAT_GATE_CLKCMU_MCSC_ITSC, 21, 0, 0),
+	GATE(CLK_GOUT_CMU_ISPFE_NOC, "gout_cmu_ispfe_noc", "mout_cmu_ispfe_noc",
+	     G3_CLK_CON_GAT_GATE_CLKCMU_ISPFE_NOC, 21, 0, 0),
 	GATE(CLK_GOUT_CMU_MCSC_MCSC, "gout_cmu_mcsc_mcsc", "mout_cmu_mcsc_mcsc",
 	     CLK_CON_GAT_GATE_CLKCMU_MCSC_MCSC, 21, 0, 0),
 	GATE(CLK_GOUT_CMU_MFC_MFC, "gout_cmu_mfc_mfc", "mout_cmu_mfc_mfc",

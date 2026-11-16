@@ -1015,10 +1015,10 @@
 	/* Camera front end (CSIS + PDMA @0x1c000000) power, for bring-up. */
 	ispfe-bringup {
 		compatible = "google,zuma-ispfe-bringup";
+		/* PMU ISPFE_CONFIGURATION/STATUS, also mapped by pd_ispfe */
+		reg = <0x0 0x15462480 0x8>;
 		power-domains = <&pd_ispfe>;
-		clocks = <&cmu_top CLK_DOUT_CMU_CSIS_BUS>,
-			 <&cmu_top CLK_DOUT_CMU_PDP_BUS>,
-			 <&cmu_top CLK_DOUT_CMU_IPP_BUS>;
+		clocks = <&cmu_top CLK_DOUT_CMU_ISPFE_NOC>;
 	};
 };
 
