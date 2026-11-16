@@ -1465,6 +1465,22 @@ static const struct regmap_config max77759_fg_regmap_cfg = {
 	.cache_type = REGCACHE_NONE,
 };
 
+/*
+ * A real MAX77759 gauge (Pixel 6, Pixel 8 Pro) sends the low byte first, as
+ * upstream has it. The big-endian config above is this tree's adaptation for
+ * the Pixel 9 BMS ("google,zuma-fuel-gauge"); on husky it byte-swapped every
+ * register (RepSOC 0x54e9 read as 0xe954, TaskPeriod 0x1680 as 0x8016).
+ */
+static const struct regmap_config max77759_fg_le_regmap_cfg = {
+	.reg_bits = 8,
+	.val_bits = 16,
+	.max_register = 0xff,
+	.wr_table = &max77759_fg_write_table,
+	.rd_table = &max77759_fg_rd_table,
+	.val_format_endian = REGMAP_ENDIAN_NATIVE,
+	.cache_type = REGCACHE_NONE,
+};
+
 static const struct power_supply_desc max17042_psy_desc = {
 	.name		= "max170xx_battery",
 	.type		= POWER_SUPPLY_TYPE_BATTERY,
@@ -1511,7 +1527,10 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
 	chip->chip_type = chip_type;
 
 	if (chip->chip_type == MAXIM_DEVICE_TYPE_MAX77759)
-		regmap_config = &max77759_fg_regmap_cfg;
+		regmap_config = of_device_is_compatible(dev->of_node,
+						"google,zuma-fuel-gauge") ?
+				&max77759_fg_regmap_cfg :
+				&max77759_fg_le_regmap_cfg;
 	else
 		regmap_config = &max17042_regmap_config;
 	chip->regmap = devm_regmap_init_i2c(client, regmap_config);
@@ -1607,7 +1626,15 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read status\n");
 
-	if (val & STATUS_POR_BIT) {
+	/*
+	 * On Pixels the bootloader/vendor BMS loads the MAX77759 gauge's
+	 * battery model and may leave POR set; programming the generic
+	 * defaults here would overwrite that model. Only read it.
+	 */
+	if ((val & STATUS_POR_BIT) && chip->chip_type == MAXIM_DEVICE_TYPE_MAX77759) {
+		dev_info(dev, "POR set, leaving the gauge's model untouched\n");
+		WRITE_ONCE(chip->init_complete, true);
+	} else if (val & STATUS_POR_BIT) {
 		ret = devm_delayed_work_autocancel(dev, &chip->work,
 						   max17042_init_worker);
 		if (ret)

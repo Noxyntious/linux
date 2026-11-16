@@ -617,6 +617,14 @@ static void psy_work_item(struct work_struct *work)
 		goto err;
 	}
 
+	/*
+	 * A Type-C source at default USB power (Rp-default, no PD) reports no
+	 * current limit; USB 2.0 still guarantees 500 mA, so charge at that
+	 * rather than not at all.
+	 */
+	if (online.intval && !current_limit.intval)
+		current_limit.intval = 500000;
+
 	if (online.intval && current_limit.intval) {
 		ret = set_input_current_limit(chg, current_limit.intval);
 		if (ret) {
