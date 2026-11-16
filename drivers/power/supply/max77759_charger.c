@@ -19,6 +19,7 @@
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/delay.h>
 #include <linux/regulator/driver.h>
 #include <linux/string_choices.h>
 #include <linux/workqueue.h>
@@ -444,17 +445,34 @@ static int charger_set_mode(struct max77759_charger *chg,
 	return 0;
 }
 
+static void max77759_otg_report(struct max77759_charger *chg, const char *what)
+{
+	unsigned int cnfg00 = 0, d00 = 0, d01 = 0, d02 = 0;
+
+	regmap_read(chg->regmap, MAX77759_CHGR_REG_CHG_CNFG_00, &cnfg00);
+	regmap_read(chg->regmap, MAX77759_CHGR_REG_CHG_DETAILS_00, &d00);
+	regmap_read(chg->regmap, MAX77759_CHGR_REG_CHG_DETAILS_01, &d01);
+	regmap_read(chg->regmap, MAX77759_CHGR_REG_CHG_DETAILS_02, &d02);
+	dev_info(chg->dev, "otg %s: CNFG_00=%#04x DETAILS_00=%#04x 01=%#04x 02=%#04x\n",
+		 what, cnfg00, d00, d01, d02);
+}
+
 static int enable_chgin_otg(struct regulator_dev *rdev)
 {
 	struct max77759_charger *chg = rdev_get_drvdata(rdev);
+	int ret;
 
-	return charger_set_mode(chg, MAX77759_CHGR_MODE_OTG_BOOST_ON);
+	ret = charger_set_mode(chg, MAX77759_CHGR_MODE_OTG_BOOST_ON);
+	msleep(50);
+	max77759_otg_report(chg, ret ? "enable FAILED" : "enabled");
+	return ret;
 }
 
 static int disable_chgin_otg(struct regulator_dev *rdev)
 {
 	struct max77759_charger *chg = rdev_get_drvdata(rdev);
 
+	max77759_otg_report(chg, "disabling");
 	return charger_set_mode(chg, MAX77759_CHGR_MODE_OFF);
 }
 
