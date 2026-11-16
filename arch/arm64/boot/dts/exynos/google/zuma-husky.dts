@@ -866,3 +866,18 @@
 		google,aoc = <&aoc>;
 	};
 };
+
+/*
+ * Haptics: Cirrus CS40L26A on hsi2c_0 @0x43 (stock zuma-husky overlay):
+ * IRQ gpa6-3, reset gph2-3 (active low), trigger gph2-0. Bus only for now;
+ * the driver comes next.
+ */
+&usi0 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_0 {
+	clock-frequency = <1000000>;
+	status = "okay";
+};
