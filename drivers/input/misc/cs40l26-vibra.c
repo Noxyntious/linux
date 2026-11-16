@@ -1,0 +1,417 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Cirrus Logic CS40L26 haptic driver, ROM-firmware mode.
+ *
+ * The CS40L26 boots a ROM firmware on its HALO DSP that already holds a
+ * small waveform table (39 effects) and a buzz generator, and plays them
+ * when a trigger index is posted to its mailbox. This driver drives that
+ * ROM firmware only: no RAM firmware/wavetable load (cs40l26.wmfw/.bin) yet.
+ *
+ * Effects (input force feedback):
+ *  - FF_PERIODIC with an FF_CUSTOM waveform, custom_data = { bank, index },
+ *    bank 1 = ROM (the downstream and CS40L50 convention), index 0..38;
+ *  - FF_RUMBLE and the other FF_PERIODIC waveforms: the ROM buzz generator,
+ *    re-triggered until the effect's length has run out.
+ *
+ * Register map and mailbox protocol from the downstream Google/Cirrus
+ * cs40l26 driver (android kernel/google-modules/amplifiers).
+ */
+
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/input.h>
+#include <linux/module.h>
+#include <linux/mod_devicetable.h>
+#include <linux/regmap.h>
+#include <linux/workqueue.h>
+
+#define CS40L26_DEVID			0x0
+#define CS40L26_REVID			0x4
+#define CS40L26_DSP_VIRTUAL1_MBOX_1	0x13020
+
+#define CS40L26_DEVID_A			0x40A260
+#define CS40L26_DEVID_B			0x40A26B
+#define CS40L26_DEVID_L27_A		0x40A270
+#define CS40L26_DEVID_L27_B		0x40A27B
+#define CS40L26_REVID_B2		0xB2
+
+/* ROM firmware state, per silicon revision */
+#define CS40L26_A1_DSP_HALO_STATE	0x02800fa8
+#define CS40L26_A1_PM_CUR_STATE		0x02800370
+#define CS40L26_B2_DSP_HALO_STATE	0x02806af8
+#define CS40L26_B2_PM_CUR_STATE		0x02801f98
+#define CS40L26_DSP_HALO_STATE_RUN	2
+
+#define CS40L26_ROM_INDEX_START		0x01800000
+#define CS40L26_ROM_NUM_WAVES		39
+#define CS40L26_BUZZGEN_INDEX		0x01800080
+#define CS40L26_STOP_PLAYBACK		0x05000000
+
+#define CS40L26_ROM_BANK_ID		1
+#define CS40L26_CUSTOM_DATA_SIZE	2
+
+#define CS40L26_RETRIES			20
+#define CS40L26_RETRY_US		1000
+#define CS40L26_RUMBLE_PERIOD_MS	50
+#define CS40L26_MAX_EFFECTS		16
+
+struct cs40l26_effect {
+	u32 trigger;
+	bool repeat;		/* buzz: re-trigger for the effect's length */
+	u16 length_ms;
+};
+
+struct cs40l26 {
+	struct device *dev;
+	struct regmap *regmap;
+	struct input_dev *input;
+	struct gpio_desc *reset;
+	struct mutex lock;	/* serialises mailbox traffic */
+	u32 revid;
+	u32 halo_state_reg;
+
+	struct cs40l26_effect effects[CS40L26_MAX_EFFECTS];
+
+	/* playback requests from atomic context */
+	spinlock_t req_lock;
+	int req_id;
+	bool req_on;
+	struct work_struct play_work;
+	struct delayed_work repeat_work;
+	unsigned long repeat_end;
+	u32 repeat_trigger;
+};
+
+static const struct regmap_config cs40l26_regmap = {
+	.reg_bits = 32,
+	.reg_stride = 4,
+	.val_bits = 32,
+	.reg_format_endian = REGMAP_ENDIAN_BIG,
+	.val_format_endian = REGMAP_ENDIAN_BIG,
+	.max_register = 0x3ffffff,
+};
+
+/* The chip NAKs the first transaction while hibernating; it wakes on it. */
+static int cs40l26_read(struct cs40l26 *cs, u32 reg, u32 *val)
+{
+	int i, ret;
+
+	for (i = 0; i < CS40L26_RETRIES; i++) {
+		ret = regmap_read(cs->regmap, reg, val);
+		if (!ret)
+			return 0;
+		usleep_range(CS40L26_RETRY_US, CS40L26_RETRY_US + 100);
+	}
+	return ret;
+}
+
+static int cs40l26_write(struct cs40l26 *cs, u32 reg, u32 val)
+{
+	int i, ret;
+
+	for (i = 0; i < CS40L26_RETRIES; i++) {
+		ret = regmap_write(cs->regmap, reg, val);
+		if (!ret)
+			return 0;
+		usleep_range(CS40L26_RETRY_US, CS40L26_RETRY_US + 100);
+	}
+	return ret;
+}
+
+/* Post a command and wait for the DSP to clear the mailbox (its ACK). */
+static int cs40l26_mailbox(struct cs40l26 *cs, u32 cmd)
+{
+	u32 val = cmd;
+	int i, ret;
+
+	ret = cs40l26_write(cs, CS40L26_DSP_VIRTUAL1_MBOX_1, cmd);
+	if (ret) {
+		dev_err(cs->dev, "mailbox write %#x failed: %d\n", cmd, ret);
+		return ret;
+	}
+
+	for (i = 0; i < CS40L26_RETRIES; i++) {
+		ret = cs40l26_read(cs, CS40L26_DSP_VIRTUAL1_MBOX_1, &val);
+		if (ret)
+			return ret;
+		if (!val)
+			return 0;
+		usleep_range(CS40L26_RETRY_US, CS40L26_RETRY_US + 100);
+	}
+
+	dev_err(cs->dev, "mailbox %#x not acknowledged (%#x)\n", cmd, val);
+	return -ETIMEDOUT;
+}
+
+static void cs40l26_repeat_work(struct work_struct *work)
+{
+	struct cs40l26 *cs = container_of(to_delayed_work(work), struct cs40l26,
+					  repeat_work);
+
+	mutex_lock(&cs->lock);
+	if (time_before(jiffies, cs->repeat_end)) {
+		cs40l26_mailbox(cs, cs->repeat_trigger);
+		schedule_delayed_work(&cs->repeat_work,
+				      msecs_to_jiffies(CS40L26_RUMBLE_PERIOD_MS));
+	} else {
+		cs40l26_mailbox(cs, CS40L26_STOP_PLAYBACK);
+	}
+	mutex_unlock(&cs->lock);
+}
+
+static void cs40l26_play_work(struct work_struct *work)
+{
+	struct cs40l26 *cs = container_of(work, struct cs40l26, play_work);
+	struct cs40l26_effect *e;
+	unsigned long flags;
+	bool on;
+	int id;
+
+	spin_lock_irqsave(&cs->req_lock, flags);
+	id = cs->req_id;
+	on = cs->req_on;
+	spin_unlock_irqrestore(&cs->req_lock, flags);
+
+	cancel_delayed_work_sync(&cs->repeat_work);
+
+	mutex_lock(&cs->lock);
+	if (!on || id < 0 || id >= CS40L26_MAX_EFFECTS) {
+		cs40l26_mailbox(cs, CS40L26_STOP_PLAYBACK);
+		goto out;
+	}
+
+	e = &cs->effects[id];
+	if (cs40l26_mailbox(cs, e->trigger))
+		goto out;
+
+	if (e->repeat) {
+		cs->repeat_trigger = e->trigger;
+		cs->repeat_end = jiffies + msecs_to_jiffies(e->length_ms ?: 1000);
+		schedule_delayed_work(&cs->repeat_work,
+				      msecs_to_jiffies(CS40L26_RUMBLE_PERIOD_MS));
+	}
+out:
+	mutex_unlock(&cs->lock);
+}
+
+static int cs40l26_upload_effect(struct input_dev *dev, struct ff_effect *effect,
+				 struct ff_effect *old)
+{
+	struct cs40l26 *cs = input_get_drvdata(dev);
+	struct cs40l26_effect *e;
+	s16 data[CS40L26_CUSTOM_DATA_SIZE];
+
+	if (effect->id < 0 || effect->id >= CS40L26_MAX_EFFECTS)
+		return -EINVAL;
+	e = &cs->effects[effect->id];
+
+	switch (effect->type) {
+	case FF_PERIODIC:
+		if (effect->u.periodic.waveform != FF_CUSTOM) {
+			e->trigger = CS40L26_BUZZGEN_INDEX;
+			e->repeat = true;
+			e->length_ms = effect->replay.length;
+			return 0;
+		}
+
+		if (effect->u.periodic.custom_len != CS40L26_CUSTOM_DATA_SIZE)
+			return -EINVAL;
+		if (copy_from_user(data, effect->u.periodic.custom_data,
+				   sizeof(data)))
+			return -EFAULT;
+		if (data[0] != CS40L26_ROM_BANK_ID) {
+			dev_dbg(cs->dev, "bank %d needs the RAM firmware\n", data[0]);
+			return -EOPNOTSUPP;
+		}
+		if (data[1] < 0 || data[1] >= CS40L26_ROM_NUM_WAVES)
+			return -EINVAL;
+
+		e->trigger = CS40L26_ROM_INDEX_START + data[1];
+		e->repeat = false;
+		e->length_ms = 0;
+		return 0;
+
+	case FF_RUMBLE:
+		if (!effect->u.rumble.strong_magnitude &&
+		    !effect->u.rumble.weak_magnitude)
+			return -EINVAL;
+		e->trigger = CS40L26_BUZZGEN_INDEX;
+		e->repeat = true;
+		e->length_ms = effect->replay.length;
+		return 0;
+
+	default:
+		return -EINVAL;
+	}
+}
+
+static int cs40l26_playback(struct input_dev *dev, int effect_id, int value)
+{
+	struct cs40l26 *cs = input_get_drvdata(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&cs->req_lock, flags);
+	cs->req_id = effect_id;
+	cs->req_on = value > 0;
+	spin_unlock_irqrestore(&cs->req_lock, flags);
+
+	schedule_work(&cs->play_work);
+	return 0;
+}
+
+static int cs40l26_erase(struct input_dev *dev, int effect_id)
+{
+	struct cs40l26 *cs = input_get_drvdata(dev);
+
+	if (effect_id >= 0 && effect_id < CS40L26_MAX_EFFECTS)
+		memset(&cs->effects[effect_id], 0, sizeof(cs->effects[0]));
+	return 0;
+}
+
+static void cs40l26_cancel(void *data)
+{
+	struct cs40l26 *cs = data;
+
+	cancel_work_sync(&cs->play_work);
+	cancel_delayed_work_sync(&cs->repeat_work);
+	mutex_lock(&cs->lock);
+	cs40l26_mailbox(cs, CS40L26_STOP_PLAYBACK);
+	mutex_unlock(&cs->lock);
+}
+
+static int cs40l26_identify(struct cs40l26 *cs)
+{
+	u32 devid, state = 0;
+	int i, ret;
+
+	ret = cs40l26_read(cs, CS40L26_DEVID, &devid);
+	if (ret)
+		return dev_err_probe(cs->dev, ret, "no response\n");
+
+	switch (devid & GENMASK(23, 0)) {
+	case CS40L26_DEVID_A:
+	case CS40L26_DEVID_B:
+	case CS40L26_DEVID_L27_A:
+	case CS40L26_DEVID_L27_B:
+		break;
+	default:
+		return dev_err_probe(cs->dev, -ENODEV, "unknown device %#x\n", devid);
+	}
+
+	ret = cs40l26_read(cs, CS40L26_REVID, &cs->revid);
+	if (ret)
+		return ret;
+	cs->revid &= 0xff;
+
+	cs->halo_state_reg = cs->revid == CS40L26_REVID_B2 ?
+			     CS40L26_B2_DSP_HALO_STATE : CS40L26_A1_DSP_HALO_STATE;
+
+	/* the ROM firmware takes a moment to start after reset */
+	for (i = 0; i < 100; i++) {
+		ret = cs40l26_read(cs, cs->halo_state_reg, &state);
+		if (!ret && state == CS40L26_DSP_HALO_STATE_RUN)
+			break;
+		usleep_range(1000, 1100);
+	}
+	if (state != CS40L26_DSP_HALO_STATE_RUN)
+		return dev_err_probe(cs->dev, -ENODEV,
+				     "ROM firmware not running (HALO_STATE %#x)\n",
+				     state);
+
+	dev_info(cs->dev, "CS40L%02X rev %02X, ROM firmware running\n",
+		 (devid >> 4) & 0xff, cs->revid);
+	return 0;
+}
+
+static int cs40l26_probe(struct i2c_client *client)
+{
+	struct device *dev = &client->dev;
+	struct ff_device *ff;
+	struct cs40l26 *cs;
+	int ret;
+
+	cs = devm_kzalloc(dev, sizeof(*cs), GFP_KERNEL);
+	if (!cs)
+		return -ENOMEM;
+
+	cs->dev = dev;
+	mutex_init(&cs->lock);
+	spin_lock_init(&cs->req_lock);
+	INIT_WORK(&cs->play_work, cs40l26_play_work);
+	INIT_DELAYED_WORK(&cs->repeat_work, cs40l26_repeat_work);
+
+	cs->regmap = devm_regmap_init_i2c(client, &cs40l26_regmap);
+	if (IS_ERR(cs->regmap))
+		return PTR_ERR(cs->regmap);
+
+	/* reset pulse: the ROM firmware boots fresh, in a known state */
+	cs->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(cs->reset))
+		return PTR_ERR(cs->reset);
+	if (cs->reset) {
+		usleep_range(2000, 2200);
+		gpiod_set_value_cansleep(cs->reset, 0);
+		usleep_range(3000, 3200);
+	}
+
+	ret = cs40l26_identify(cs);
+	if (ret)
+		return ret;
+
+	cs->input = devm_input_allocate_device(dev);
+	if (!cs->input)
+		return -ENOMEM;
+
+	cs->input->name = "cs40l26_input";
+	cs->input->id.bustype = BUS_I2C;
+	input_set_drvdata(cs->input, cs);
+
+	input_set_capability(cs->input, EV_FF, FF_PERIODIC);
+	input_set_capability(cs->input, EV_FF, FF_CUSTOM);
+	input_set_capability(cs->input, EV_FF, FF_SINE);
+	input_set_capability(cs->input, EV_FF, FF_RUMBLE);
+
+	ret = input_ff_create(cs->input, CS40L26_MAX_EFFECTS);
+	if (ret)
+		return ret;
+
+	ff = cs->input->ff;
+	ff->upload = cs40l26_upload_effect;
+	ff->playback = cs40l26_playback;
+	ff->erase = cs40l26_erase;
+
+	ret = devm_add_action_or_reset(dev, cs40l26_cancel, cs);
+	if (ret)
+		return ret;
+
+	return input_register_device(cs->input);
+}
+
+static const struct of_device_id cs40l26_of_match[] = {
+	{ .compatible = "cirrus,cs40l26a" },
+	{ .compatible = "cirrus,cs40l26b" },
+	{ .compatible = "cirrus,cs40l27a" },
+	{ .compatible = "cirrus,cs40l27b" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, cs40l26_of_match);
+
+static const struct i2c_device_id cs40l26_id[] = {
+	{ "cs40l26a" },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, cs40l26_id);
+
+static struct i2c_driver cs40l26_driver = {
+	.driver = {
+		.name = "cs40l26",
+		.of_match_table = cs40l26_of_match,
+	},
+	.probe = cs40l26_probe,
+	.id_table = cs40l26_id,
+};
+module_i2c_driver(cs40l26_driver);
+
+MODULE_DESCRIPTION("Cirrus Logic CS40L26 haptics (ROM firmware)");
+MODULE_LICENSE("GPL");

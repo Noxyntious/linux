@@ -158,6 +158,17 @@ config INPUT_BMA150
 	  To compile this driver as a module, choose M here: the
 	  module will be called bma150.
 
+config INPUT_CS40L26_VIBRA
+	tristate "Cirrus Logic CS40L26 haptics (ROM firmware)"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Force-feedback driver for the CS40L26/27 haptic amplifier, using the
+	  waveforms and buzz generator of its ROM firmware (Pixel 8 Pro).
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called cs40l26-vibra.
+
 config INPUT_CS40L50_VIBRA
 	tristate "CS40L50 Haptic Driver support"
 	depends on MFD_CS40L50_CORE
