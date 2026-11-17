@@ -955,6 +955,19 @@ static void zumapro_sys_sleep_resume(void *data)
 	if (pm_suspend_target_state != PM_SUSPEND_MEM)
 		return;
 
+	/*
+	 * The wake reason, as downstream exynos-pm prints it on every resume:
+	 * WAKEUP_STAT bit 4 is the EINT aggregate (power key, CP2AP_WAKEUP,
+	 * ...), bits 0-3 RTC.  The kernel clock is frozen across SYS_SLEEP, so
+	 * this line is the only sign in the log that the SoC really slept.
+	 */
+	{
+		unsigned int st = 0, st2 = 0;
+
+		regmap_read(pmu_context->pmureg, GS101_WAKEUP_STAT, &st);
+		regmap_read(pmu_context->pmureg, 0x3970, &st2);
+		pr_info("sys-sleep: wakeup stat 0x%08x stat2 0x%08x\n", st, st2);
+	}
 	zumapro_sys_sleep_disarm();
 	zumapro_restore_sleep_exit_drcg();
 	zumapro_restore_sleep_exit_top_out();
