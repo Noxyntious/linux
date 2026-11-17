@@ -60,6 +60,8 @@ struct exynos_s2mpu {
 	void __iomem *base;
 	struct notifier_block genpd_nb;
 	unsigned int num_ctx;
+	bool always_on;		/* no power domain to watch */
+	bool powered;		/* domain-backed: domain currently on */
 };
 
 static void exynos_s2mpu_install(struct exynos_s2mpu *s2mpu)
@@ -125,8 +127,12 @@ static int exynos_s2mpu_genpd_notify(struct notifier_block *nb,
 	struct exynos_s2mpu *s2mpu = container_of(nb, struct exynos_s2mpu,
 						  genpd_nb);
 
-	if (action == GENPD_NOTIFY_ON)
+	if (action == GENPD_NOTIFY_ON) {
 		exynos_s2mpu_install(s2mpu);
+		WRITE_ONCE(s2mpu->powered, true);
+	} else if (action == GENPD_NOTIFY_PRE_OFF) {
+		WRITE_ONCE(s2mpu->powered, false);
+	}
 
 	return NOTIFY_OK;
 }
@@ -157,6 +163,7 @@ static int exynos_s2mpu_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, s2mpu);
 	exynos_s2mpu_install(s2mpu);
+	s2mpu->powered = true;
 
 	/*
 	 * An always-on unit has no domain to watch, and dev_pm_genpd_add_notifier()
@@ -170,6 +177,7 @@ static int exynos_s2mpu_probe(struct platform_device *pdev)
 	s2mpu->genpd_nb.notifier_call = exynos_s2mpu_genpd_notify;
 	ret = dev_pm_genpd_add_notifier(dev, &s2mpu->genpd_nb);
 	if (ret == -ENODEV) {
+		s2mpu->always_on = true;
 		dev_info(dev, "v9 allow-all installed, always-on (version %#x, %u contexts)\n",
 			 version, s2mpu->num_ctx);
 		return 0;
@@ -201,7 +209,15 @@ static int exynos_s2mpu_probe(struct platform_device *pdev)
  */
 static int __maybe_unused exynos_s2mpu_resume_early(struct device *dev)
 {
-	exynos_s2mpu_install(dev_get_drvdata(dev));
+	struct exynos_s2mpu *s2mpu = dev_get_drvdata(dev);
+
+	/*
+	 * A domain-backed unit whose domain is off must not be touched (the
+	 * access is an asynchronous SError); its GENPD_NOTIFY_ON reinstalls it
+	 * when the domain next powers up.
+	 */
+	if (s2mpu && (s2mpu->always_on || READ_ONCE(s2mpu->powered)))
+		exynos_s2mpu_install(s2mpu);
 	return 0;
 }
 
