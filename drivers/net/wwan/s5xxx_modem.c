@@ -384,6 +384,15 @@ struct s5xxx_variant {
  * ONLINE the modem pulls its carrier config and persists NV over it, and rejects
  * SETUP_DATA_CALL ("no carrier config") until an AP-side RFS server answers.
  */
+/*
+ * Debug: log what the CP sends right after each system resume (the first
+ * frames per channel, RFS file I/O) and the CP2AP_WAKEUP level around the
+ * sleep -- how the CP-initiated wakes were attributed to their sources.
+ */
+static bool wake_debug;
+module_param(wake_debug, bool, 0644);
+MODULE_PARM_DESC(wake_debug, "log CP traffic that follows a system resume");
+
 #define S5XXX_CH_RFS			0x29
 #define S5XXX_RFS_MAX			SZ_4K
 
@@ -695,6 +704,7 @@ struct s5xxx_modem {
 	u8			ul_end_bit_owner;
 	bool			ul_active;
 	bool			tx_suspended;	/* CP TX flow control (cp2ap_status) */
+	int			wake_rx_log;	/* debug: frames to log after a wake */
 	int			nvec;		/* MSI vectors actually allocated */
 };
 
@@ -1035,6 +1045,17 @@ static void s5xxx_send_ipc_irq(struct s5xxx_modem *sm, u32 val)
 		 * doorbell -- exactly the CP-initiated wake path.
 		 */
 		zumapro_pcie_modem_wake(sm->rc_dev);
+
+		/*
+		 * The CP may already be holding CP2AP_WAKEUP high (it asked for
+		 * the link and that request's edge was consumed while the link
+		 * was still up, or never reached us).  Then the nudge produces
+		 * no new edge and nothing would ever relink: act on the level.
+		 */
+		if (gpiod_get_value(sm->cp2ap_wakeup)) {
+			WRITE_ONCE(sm->cp_wants_up, 1);
+			queue_work(sm->pm_wq, &sm->pm_work);
+		}
 	}
 }
 
@@ -2570,6 +2591,11 @@ static void s5xxx_rfs_handle(struct s5xxx_modem *sm, const u8 *f, u32 n)
 			return;
 		}
 		e->token = token;
+		if (wake_debug)
+			dev_info(sm->dev, "RFS io: fid %u %s off %#x len %u\n", fid,
+				 iotype == S5XXX_RFS_IO_READ ? "read" :
+				 iotype == S5XXX_RFS_IO_WRITE ? "WRITE" : "?",
+				 off, iolen);
 		if (iotype == S5XXX_RFS_IO_READ) {
 			e->roff = off;
 			e->rremain = iolen;
@@ -2738,6 +2764,10 @@ static void s5xxx_drain_raw_rxq(struct s5xxx_modem *sm, u32 intval)
 		ch = hdr[8];
 		plen = flen - S5XXX_SIT_HDR;
 		pdp = s5xxx_pdp_ndev(sm, ch);
+		if (READ_ONCE(sm->wake_rx_log) > 0) {
+			WRITE_ONCE(sm->wake_rx_log, sm->wake_rx_log - 1);
+			dev_info(sm->dev, "wake rx: raw ch %#x len %u\n", ch, plen);
+		}
 
 		if (ch == S5XXX_CH_RFS) {
 			had_raw = true;
@@ -2918,6 +2948,17 @@ static void s5xxx_drain_fmt_rxq(struct s5xxx_modem *sm, u32 intval)
 			break;			/* partial frame; wait for more */
 		plen = flen - S5XXX_SIT_HDR;
 
+		if (READ_ONCE(sm->wake_rx_log) > 0) {
+			u8 pk[12] = {};
+
+			WRITE_ONCE(sm->wake_rx_log, sm->wake_rx_log - 1);
+			s5xxx_circ_read(pk, buff, S5XXX_FMT_RXQ_SIZE,
+					(out + S5XXX_SIT_HDR) % S5XXX_FMT_RXQ_SIZE,
+					min_t(u32, plen, sizeof(pk)));
+			dev_info(sm->dev, "wake rx: fmt ch %#x len %u %*ph\n",
+				 hdr[8], plen, (int)min_t(u32, plen, sizeof(pk)), pk);
+		}
+
 		oc = s5xxx_oem_lookup(sm, hdr[8]);
 		sc = oc ? NULL : s5xxx_sit_lookup(sm, hdr[8]);
 		if (oc) {
@@ -2989,6 +3030,21 @@ static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
 	/* Pairs with the release in s5xxx_register_netdev(). */
 	if (!sm->pktproc || !smp_load_acquire(&sm->pdp_up))
 		return;
+
+	if (READ_ONCE(sm->wake_rx_log) > 0) {
+		u32 h[S5XXX_PKTPROC_DL_NUM_QUEUE] = {};
+
+		for (q = 0; q < S5XXX_PKTPROC_DL_NUM_QUEUE; q++) {
+			void __iomem *qi = info + 4 + q * 20;
+
+			h[q] = (readl(qi + 16) % n + n - sm->dl_done[q]) % n;
+		}
+		WRITE_ONCE(sm->wake_rx_log, sm->wake_rx_log - 1);
+		dev_info(sm->dev, "wake rx: pktproc DL pending per queue %u %u %u %u\n",
+			 h[0], S5XXX_PKTPROC_DL_NUM_QUEUE > 1 ? h[1] : 0,
+			 S5XXX_PKTPROC_DL_NUM_QUEUE > 2 ? h[2] : 0,
+			 S5XXX_PKTPROC_DL_NUM_QUEUE > 3 ? h[3] : 0);
+	}
 
 	for (q = 0; q < S5XXX_PKTPROC_DL_NUM_QUEUE; q++) {
 		void __iomem *qinfo = info + 4 + q * 20;
@@ -5366,14 +5422,36 @@ static void s5xxx_remove(struct platform_device *pdev)
 static int s5xxx_suspend_noirq(struct device *dev)
 {
 	struct s5xxx_modem *sm = dev_get_drvdata(dev);
+	int ret;
 
 	if (gpiod_get_value(sm->cp2ap_wakeup)) {
 		dev_info(dev, "CP requests PCIe, aborting system suspend\n");
+		/*
+		 * Serve the request (by level, not edge) so the retried suspend
+		 * finds the CP done with the link instead of refusing forever.
+		 */
+		WRITE_ONCE(sm->cp_wants_up, 1);
+		queue_work(sm->pm_wq, &sm->pm_work);
 		return -EBUSY;
 	}
 
 	s5xxx_publish_kernel_time(sm);
-	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, false);
+	ret = zumapro_pcie_modem_set_ap_active(sm->rc_dev, false);
+	if (ret)
+		return ret;
+
+	/*
+	 * Across the sleep itself only "CP wants the link" (a high level) may
+	 * wake the AP, as downstream arms it (IRQ_TYPE_LEVEL_HIGH).  Armed on
+	 * both edges, any CP pulse on the line -- including the falling edge
+	 * of a release -- latches the EINT pend and SYS_SLEEP exits at once.
+	 */
+	irq_set_irq_type(sm->cp2ap_irq, IRQ_TYPE_LEVEL_HIGH);
+	if (wake_debug)
+		dev_info(dev, "sleep: cp2ap_wakeup %d cp_active %d\n",
+			 gpiod_get_value(sm->cp2ap_wakeup),
+			 gpiod_get_value(sm->cp_active));
+	return 0;
 }
 
 static int s5xxx_resume_noirq(struct device *dev)
@@ -5383,6 +5461,13 @@ static int s5xxx_resume_noirq(struct device *dev)
 	unsigned long flags;
 	int ret;
 
+	if (wake_debug) {
+		WRITE_ONCE(sm->wake_rx_log, 24);
+		dev_info(dev, "wake: cp2ap_wakeup %d cp_active %d\n",
+			 gpiod_get_value(sm->cp2ap_wakeup),
+			 gpiod_get_value(sm->cp_active));
+	}
+	irq_set_irq_type(sm->cp2ap_irq, IRQ_TYPE_EDGE_BOTH);
 	s5xxx_publish_kernel_time(sm);
 	ret = zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
 
