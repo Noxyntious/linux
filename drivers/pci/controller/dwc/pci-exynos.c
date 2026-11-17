@@ -832,6 +832,21 @@ static int exynos_pcie_suspend_noirq(struct device *dev)
 {
 	struct exynos_pcie *ep = dev_get_drvdata(dev);
 
+	/*
+	 * Wi-Fi RC (the one with a WLAN_EN line): power the endpoint off
+	 * across the sleep, so that resume repeats the cold bring-up of probe
+	 * (WLAN_EN, then PERST release in start_link). A chip that stays up
+	 * comes back behind a link-down reset with its config space (BAR0
+	 * window) lost and its firmware no longer answering. Userspace removes
+	 * the endpoint before sleeping and rescans after resume, so brcmfmac
+	 * probes a fresh chip exactly as at boot. The modem RC parks its own
+	 * link and must not have its CP reset here.
+	 */
+	if (ep->drvdata->zuma && ep->wlan_gpio) {
+		gpiod_set_value_cansleep(ep->perst_gpio, 0);
+		gpiod_set_value_cansleep(ep->wlan_gpio, 0);
+	}
+
 	exynos_pcie_assert_core_reset(ep);
 	phy_power_off(ep->phy);
 	phy_exit(ep->phy);
