@@ -286,6 +286,40 @@ static void ftm5_remove(struct spi_device *spi)
 	regulator_bulk_disable(ARRAY_SIZE(ts->supplies), ts->supplies);
 }
 
+/*
+ * System sleep: the panel rails the chip shares go down in deep sleep, so on
+ * resume it comes back in reset with scanning off and never raises another
+ * interrupt.  Redo the probe-time bring-up (reset, wait for ready, scan on)
+ * with the IRQ masked, and drop any contacts that were down at suspend.
+ */
+static int ftm5_suspend(struct device *dev)
+{
+	struct ftm5 *ts = dev_get_drvdata(dev);
+
+	disable_irq(ts->spi->irq);
+	ftm5_set_scan(ts, false);
+	return 0;
+}
+
+static int ftm5_resume(struct device *dev)
+{
+	struct ftm5 *ts = dev_get_drvdata(dev);
+	int ret;
+
+	ret = ftm5_reset(ts);
+	if (!ret)
+		ret = ftm5_set_scan(ts, true);
+	if (ret)
+		dev_err(dev, "resume failed: %d\n", ret);
+
+	input_mt_sync_frame(ts->input);
+	input_sync(ts->input);
+	enable_irq(ts->spi->irq);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(ftm5_pm_ops, ftm5_suspend, ftm5_resume);
+
 static const struct of_device_id ftm5_of_match[] = {
 	{ .compatible = "st,ftm5" },
 	{ }
@@ -302,6 +336,7 @@ static struct spi_driver ftm5_driver = {
 	.driver = {
 		.name = "st-ftm5",
 		.of_match_table = ftm5_of_match,
+		.pm = pm_sleep_ptr(&ftm5_pm_ops),
 	},
 	.id_table = ftm5_spi_ids,
 	.probe = ftm5_probe,
