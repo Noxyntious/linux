@@ -19,6 +19,7 @@
 
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
+#include <dt-bindings/spmi/spmi.h>
 #include <dt-bindings/usb/pd.h>
 #include "zumapro-pinctrl.h"
 #include "zuma.dtsi"
@@ -422,12 +423,16 @@
 	 * Sub PMIC (S2MPG15), only the AoC sensor rails. Enable-only, like on
 	 * the Pixel 9: the bootloader leaves the voltages where the AoC wants
 	 * them (stock husky overlay: L7S_SENSORS 1.8 V, L5S_PROX 3.3 V).
-	 * Same IRQ as on the Pixel 9 (gpa0-1).
+	 * Same IRQ pin as on the Pixel 9 (gpa0-1), but on husky the modem drives
+	 * that pin too (CP2AP_CP_WRST_N, held while the CP runs; the vendor DT
+	 * lists it for both). As a level IRQ it stormed CPU0 (100k spurious hits,
+	 * USB/NBD stalled) as soon as the CP was powered, so take it on edges:
+	 * the driver needs an IRQ, and the CP only toggles the line on a reset.
 	 */
 	pmic-2 {
 		compatible = "samsung,s2mpg15-pmic";
 		interrupt-parent = <&gpa0>;
-		interrupts = <1 0 0>, <1 0 1>;
+		interrupts = <1 IRQ_TYPE_EDGE_RISING>;
 
 		regulators {
 			s_ldo5_reg: ldo5s {
@@ -701,6 +706,94 @@
 	host-wake-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;		/* WL_HOST_WAKE */
 	device-wake-gpios = <&gph3 5 GPIO_ACTIVE_HIGH>;		/* WL_DEV_WAKE */
 	max-link-speed = <3>;
+	status = "okay";
+};
+
+/*
+ * Modem: Exynos Modem 5300 on PCIe CH0 (HSI1), the same part as the Pixel 9a
+ * (s5xxx driver, "samsung,s5300-modem"). From the shusky vendor DT
+ * (zuma-board-cp-s5300-sit.dtsi, zuma-cp-s5300-sit.dtsi, zuma-board-pcie.dtsi,
+ * zuma-rmem.dtsi). Against the Pixel 9's S5400 (zumapro-caimito-s5400.dtsi):
+ * the shared-memory carveouts, doorbell and PERST/CLKREQ pins are the same; the
+ * AP2CP/CP2AP lines are not; the bit-banged SPMI bus is on gpa3-0/1 (gpa3-2 is
+ * ODPM vbatt here) and carries only the S5910 DCXO -- no CP PMIC, so no PMIC
+ * warm-reset patch -- and the S5910 has no power-on sequence (its vendor
+ * s5910,seq is the shutdown one). There is no partial-reset line.
+ *
+ * gpa0-1 (CP2AP_CP_WRST_N) is also listed as an S2MPG15 interrupt in pmic-2,
+ * as in the vendor DT; the CP side only samples it as an input.
+ */
+/ {
+	spmi-cp {
+		compatible = "google,bitbang-spmi-controller";
+		#address-cells = <2>;
+		#size-cells = <0>;
+		sclk-gpios = <&gpa3 0 GPIO_ACTIVE_HIGH>;
+		sdata-gpios = <&gpa3 1 GPIO_ACTIVE_HIGH>;
+		delay-us = <10>;
+
+		cp_s5910: s5910@5 {
+			compatible = "google,s5910-spmi";
+			reg = <5 SPMI_USID>;
+		};
+	};
+
+	cp_power: cp-power {
+		compatible = "google,exynos-cp-power";
+		cp-pwr-gpios = <&gph1 2 GPIO_ACTIVE_HIGH>;
+		cp-nreset-gpios = <&gph1 7 GPIO_ACTIVE_HIGH>;
+		cp-pm-wrst-gpios = <&gpa0 2 GPIO_ACTIVE_HIGH>;
+		cp-wrst-gpios = <&gph1 1 GPIO_ACTIVE_HIGH>;
+		cp-pda-active-gpios = <&gph1 0 GPIO_ACTIVE_HIGH>;
+		cp-dump-noti-gpios = <&gph0 3 GPIO_ACTIVE_HIGH>;
+		cp2ap-cp-wrst-gpios = <&gpa0 1 GPIO_ACTIVE_HIGH>;
+		google,cp-dcxo = <&cp_s5910>;
+	};
+
+	reserved-memory {
+		cp_rmem_reserved: cp-rmem@ea400000 {
+			reg = <0x0 0xea400000 0xc00000>;
+			no-map;
+		};
+
+		cp_msi_rmem_reserved: cp-msi-rmem@f6200000 {
+			reg = <0x0 0xf6200000 0x1000>;
+			no-map;
+		};
+
+		cp_pktproc_rmem_reserved: cp-pktproc-rmem@e8000000 {
+			reg = <0x0 0xe8000000 0x2000000>;
+			no-map;
+		};
+	};
+
+	modem {
+		compatible = "samsung,s5300-modem";
+		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
+				<&cp_pktproc_rmem_reserved>;
+		memory-region-names = "ipc", "msi", "pktproc";
+		/* the modem_<slot> partition's image, unmodified */
+		firmware-name = "google/s5300/modem/images/default/modem.bin";
+		google,pcie = <&pcie_0>;
+		samsung,doorbell-addr = <0x14e60000>;	/* vendor pci_db_addr */
+		/* vendor BAR layout: BAR0 = 0x14e00000, doorbell at +0x60000 */
+		samsung,doorbell-in-bar0;
+		cp2ap-wakeup-gpios = <&gpa6 5 GPIO_ACTIVE_HIGH>;
+		cp2ap-active-gpios = <&gpa7 0 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&pcie_0_phy {
+	status = "okay";
+};
+
+&pcie_0 {
+	pinctrl-0 = <&pcie0_clkreq &pcie0_perst>;
+	pinctrl-names = "default";
+	reset-gpios = <&gph0 0 GPIO_ACTIVE_HIGH>;		/* PERST */
+	google,cp-wakeup-gpios = <&gph0 2 GPIO_ACTIVE_HIGH>;	/* AP2CP_WAKEUP */
+	google,cp-power = <&cp_power>;
+	samsung,perst-delay-us = <18000>;
 	status = "okay";
 };
 
