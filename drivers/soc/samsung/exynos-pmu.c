@@ -631,8 +631,27 @@ static int zumapro_cpu_pm_notify(struct notifier_block *self,
 		return NOTIFY_OK;
 	}
 
-	if (!pmu_context->sys_insuspend ||
-	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
+	/*
+	 * Ordinary awake idle: publish C2, as the vendor exynos-cpupm does on
+	 * every idle entry (pmucal_cpu_disable() -> CPU_INFORM_C2; the per-core
+	 * PMU sequences themselves are empty on zuma). Without the hint the
+	 * firmware refuses the PSCI CPU_SUSPEND: on the Tensor G3 cores 1-3
+	 * logged ~4 million rejections each in an idle half hour and sat in WFI.
+	 * The exit path above withdraws it.
+	 */
+	if (!pmu_context->sys_insuspend) {
+		if (action == CPU_PM_ENTER) {
+			if (regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpu),
+					 CPU_INFORM_C2))
+				zumapro_dbg_fail++;
+			else
+				cpumask_set_cpu(cpu, &zumapro_hinted_cpus);
+		}
+		raw_spin_unlock(&pmu_context->cpupm_lock);
+		return NOTIFY_OK;
+	}
+
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
 		raw_spin_unlock(&pmu_context->cpupm_lock);
 		return NOTIFY_OK;
 	}

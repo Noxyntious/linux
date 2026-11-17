@@ -704,7 +704,8 @@
 #define GS101_INFORM9                           0x0854
 #define GS101_INFORM10                          0x0858
 #define GS101_INFORM11                          0x085c
-#define GS101_CPU_INFORM(cpu)                   (0x0860 + ((cpu) & 7) * 4)
+/* one per core, contiguous: the Tensor G3's ninth core (cpu8) is at 0x0880 */
+#define GS101_CPU_INFORM(cpu)                   (0x0860 + (cpu) * 4)
 #define GS101_IROM_INFORM                       0x0880
 #define GS101_IROM_CPU_INFORM(cpu)              (0x0890 + ((cpu) & 7) * 4)
 #define GS101_PMU_SPARE(n)                      (0x0900 + ((n) & 3) * 4)
