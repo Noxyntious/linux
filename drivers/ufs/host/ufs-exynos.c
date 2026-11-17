@@ -252,6 +252,13 @@ static int zuma_ufs_drv_init(struct exynos_ufs *ufs)
 	hba->caps |= UFSHCD_CAP_WB_EN;
 
 	/*
+	 * System suspend like downstream zuma: device powered down, link off,
+	 * full link restart on resume. The default (sleep + hibern8) cannot
+	 * work: suspend isolates the PHY and asserts the device reset line.
+	 */
+	hba->spm_lvl = UFS_PM_LVL_5;
+
+	/*
 	 * Temporary stability setting for Zuma bring-up:
 	 * avoid Hibern8/clock-gating transitions until CDR/H8 exit is stable.
 	 */
@@ -1841,8 +1848,16 @@ static int exynos_ufs_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
 	if (ufs->drv_data->suspend)
 		ufs->drv_data->suspend(ufs);
 
-	if (!ufshcd_is_link_active(hba))
+	if (!ufshcd_is_link_active(hba)) {
 		phy_power_off(ufs->phy);
+		/*
+		 * Isolation loses the PHY configuration; exit here so that
+		 * resume's phy_init() puts it back to CFG_PRE_INIT and
+		 * power_on() recalibrates it (see exynos_ufs_resume()).
+		 */
+		if (ufs->drv_data->drv_init == zuma_ufs_drv_init)
+			phy_exit(ufs->phy);
+	}
 
 	return 0;
 }
@@ -1851,8 +1866,25 @@ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 {
 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
 
-	if (!ufshcd_is_link_active(hba))
+	if (!ufshcd_is_link_active(hba)) {
+		/*
+		 * zuma: the PHY came back from isolation unconfigured, and the
+		 * link restart's pre_link() issues DME commands before
+		 * exynos_ufs_phy_init() runs, which then time out (no M-PHY
+		 * clock). Re-init (CFG_PRE_INIT) so power_on() recalibrates.
+		 */
+		if (ufs->drv_data->drv_init == zuma_ufs_drv_init)
+			phy_init(ufs->phy);
 		phy_power_on(ufs->phy);
+	}
+
+	/*
+	 * SYS_SLEEP resets the HSI2 sysreg, and with it the IO-coherency
+	 * enable: the host's descriptor writes then bypass the CPU caches and
+	 * every command reads back OCS_INVALID (NOP OUT failed 15). Downstream
+	 * re-applies it on every resume (config_externals); so do we.
+	 */
+	exynos_ufs_shareability(ufs);
 
 	exynos_ufs_config_smu(ufs);
 	exynos_ufs_fmp_resume(hba);
