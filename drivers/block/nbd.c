@@ -17,6 +17,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/module.h>
+#include <linux/freezer.h>
 #include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -1593,8 +1594,23 @@ static int nbd_start_device_ioctl(struct nbd_device *nbd)
 	if (max_part)
 		set_bit(GD_NEED_PART_SCAN, &nbd->disk->state);
 	mutex_unlock(&nbd->config_lock);
-	ret = wait_event_interruptible(config->recv_wq,
-					 atomic_read(&config->recv_threads) == 0);
+	for (;;) {
+		ret = wait_event_interruptible(config->recv_wq,
+				atomic_read(&config->recv_threads) == 0);
+		/*
+		 * The freezer interrupts this wait with a fake signal on every
+		 * system suspend. That is not the client going away: tearing
+		 * the socket down here killed an NBD root at the first suspend
+		 * attempt. Freeze in place and keep waiting; only a real
+		 * signal shuts the connection down.
+		 */
+		if (!ret || fatal_signal_pending(current) || !freezing(current))
+			break;
+		try_to_freeze();
+		spin_lock_irq(&current->sighand->siglock);
+		recalc_sigpending();
+		spin_unlock_irq(&current->sighand->siglock);
+	}
 	if (ret) {
 		sock_shutdown(nbd);
 		nbd_clear_que(nbd);
