@@ -485,6 +485,21 @@ void exynos_pcie_phy_keep_refclk(struct phy *phy, bool keep)
 EXPORT_SYMBOL_GPL(exynos_pcie_phy_keep_refclk);
 
 /*
+ * PMU PHY isolation on/off, for the modem RC's system sleep: downstream
+ * exynos_pcie_rc_suspend_noirq() isolates the PHY of any RC whose link is
+ * down -- the CP's included -- so the CP sees its refclk stop in an orderly
+ * way while the AP is still running, not cut by the SYS_SLEEP power-down.
+ */
+void exynos_pcie_phy_isolate(struct phy *phy, bool isolate)
+{
+	struct exynos_pcie_phy *ep = phy_get_drvdata(phy);
+
+	regmap_update_bits(ep->pmureg, ep->pmu_offset, BIT(0),
+			   isolate ? 0 : BIT(0));
+}
+EXPORT_SYMBOL_GPL(exynos_pcie_phy_isolate);
+
+/*
  * Switch the SoC PHY sub-block clock onto the OSC ("safe") during a link
  * teardown/retrain or back to the external-PLL path (downstream
  * zumapro_pcie_phy_safe_clk): with the link down the CP may stop driving

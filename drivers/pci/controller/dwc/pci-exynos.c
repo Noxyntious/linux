@@ -170,6 +170,7 @@ struct exynos_pcie {
 	 * link-request signal it drives outside reset.
 	 */
 	struct gpio_desc		*cp_wakeup;
+	bool				cp_sleep_isolated;
 	struct exynos_cp_power		*cp_power;
 	/* modem runtime-relink state (downstream establish_link) */
 	bool				cp_phy_off;	/* PHY left powered off by link_down */
@@ -850,6 +851,17 @@ static int exynos_pcie_suspend_noirq(struct device *dev)
 			dev_info(dev, "modem link up, CP busy: suspend refused\n");
 			return -EBUSY;
 		}
+		/*
+		 * Parked: isolate the PHY as downstream does for a link that is
+		 * down (exynos_pcie_rc_suspend_noirq), stopping the CP's refclk
+		 * here instead of leaving SYS_SLEEP to cut it.  Undone in
+		 * resume_noirq, where the runtime park state (refclk held) is
+		 * restored for the s5xxx worker's relink.
+		 */
+		exynos_pcie_phy_keep_refclk(ep->phy, false);
+		exynos_pcie_phy_isolate(ep->phy, true);
+		ep->cp_sleep_isolated = true;
+		dev_info(dev, "modem link parked: PHY isolated for sleep\n");
 		return 0;
 	}
 
@@ -892,8 +904,14 @@ static int exynos_pcie_resume_noirq(struct device *dev)
 	}
 
 	/* the modem RC is resumed by the s5xxx driver (see suspend_noirq) */
-	if (ep->drvdata->zuma && ep->cp_power)
+	if (ep->drvdata->zuma && ep->cp_power) {
+		if (ep->cp_sleep_isolated) {
+			exynos_pcie_phy_isolate(ep->phy, false);
+			exynos_pcie_phy_keep_refclk(ep->phy, true);
+			ep->cp_sleep_isolated = false;
+		}
 		return 0;
+	}
 
 	/*
 	 * Our suspend_noirq put the PHY back into PMU isolation; host_init

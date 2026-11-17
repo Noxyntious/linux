@@ -23,12 +23,14 @@ struct phy;
 #if IS_ENABLED(CONFIG_PHY_EXYNOS_PCIE)
 void exynos_pcie_phy_safe_clk(struct phy *phy, bool safe);
 void exynos_pcie_phy_keep_refclk(struct phy *phy, bool keep);
+void exynos_pcie_phy_isolate(struct phy *phy, bool isolate);
 /* Deep PHY power-down / restore around a full Wi-Fi link teardown/retrain. */
 void exynos_pcie_phy_all_pwrdn(struct phy *phy);
 void exynos_pcie_phy_all_pwrdn_clear(struct phy *phy);
 #else
 static inline void exynos_pcie_phy_safe_clk(struct phy *phy, bool safe) { }
 static inline void exynos_pcie_phy_keep_refclk(struct phy *phy, bool keep) { }
+static inline void exynos_pcie_phy_isolate(struct phy *phy, bool isolate) { }
 static inline void exynos_pcie_phy_all_pwrdn(struct phy *phy) { }
 static inline void exynos_pcie_phy_all_pwrdn_clear(struct phy *phy) { }
 #endif
