@@ -1634,17 +1634,9 @@ static const struct of_device_id samsung_pinctrl_dt_match[] = {
 	{},
 };
 
-/*
- * noirq rather than late: PCIe host controllers resume in the noirq phase
- * and drive PERST/REG_ON/CLKREQ through these pins. On Tensor G3 a deep
- * sleep resets the non-alive pin banks, so restoring them only in
- * resume_early left the Wi-Fi RC training a link with its pins at reset
- * defaults (PERST never released, link down, -ENODEV). Pin controllers
- * probe early, so they still resume before and suspend after their users.
- */
 static const struct dev_pm_ops samsung_pinctrl_pm_ops = {
-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(samsung_pinctrl_suspend,
-				      samsung_pinctrl_resume)
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(samsung_pinctrl_suspend,
+				     samsung_pinctrl_resume)
 };
 
 static struct platform_driver samsung_pinctrl_driver = {
