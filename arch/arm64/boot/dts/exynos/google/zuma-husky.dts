@@ -1138,3 +1138,17 @@
 	};
 };
 
+
+/*
+ * One 1344x2992 XRGB8888 framebuffer is 3962 pages (15.5 MiB, in a 4 MiB
+ * aligned slot of 16 MiB), so zumapro's 128 MiB pool ("8 screens" at the
+ * Pixel 9's resolution) holds exactly 8 here: two wlroots swapchains of four,
+ * which the screen coming back on briefly needs. Then "FB allocation failed"
+ * and the panel stays black. ztMETRO's wlroots also allocates its offscreen
+ * render targets here (15 buffers, 232 MiB, at rest), and 10 quick screen
+ * off/on cycles still ran 256 MiB dry. 512 MiB of reusable CMA (movable
+ * allocations use it while it is free) costs nothing real on 12 GiB.
+ */
+&dpu_fb_pool {
+	size = <0x20000000>;
+};
