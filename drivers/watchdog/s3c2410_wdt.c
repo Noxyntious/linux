@@ -153,6 +153,16 @@ module_param(tmr_atboot,  int, 0);
 module_param(nowayout,   bool, 0);
 module_param(soft_noboot, int, 0);
 
+/*
+ * Debug aid for system-sleep bring-up: leave the watchdog running across
+ * suspend so that a hang in the suspend/resume path ends in a warm watchdog
+ * reset (which keeps RAM, and with it the ramoops console) instead of a dead
+ * SoC that only a cold power-key reset recovers.
+ */
+static bool keep_in_suspend;
+module_param(keep_in_suspend, bool, 0644);
+MODULE_PARM_DESC(keep_in_suspend, "Keep the watchdog running in system suspend (debug)");
+
 MODULE_PARM_DESC(tmr_margin, "Watchdog tmr_margin in seconds. (default="
 		__MODULE_STRING(S3C2410_WATCHDOG_DEFAULT_TIME) ")");
 MODULE_PARM_DESC(tmr_atboot,
@@ -890,6 +900,13 @@ static int s3c2410wdt_suspend(struct device *dev)
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
 
+	if (keep_in_suspend) {
+		/* fresh full count for the suspend */
+		s3c2410wdt_keepalive(&wdt->wdt_device);
+		dev_info(dev, "left running across suspend\n");
+		return 0;
+	}
+
 	/* Save watchdog state, and turn it off. */
 	wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);
 	wdt->wtdat_save = readl(wdt->reg_base + S3C2410_WTDAT);
@@ -908,6 +925,11 @@ static int s3c2410wdt_resume(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
+
+	if (keep_in_suspend) {
+		s3c2410wdt_keepalive(&wdt->wdt_device);
+		return 0;
+	}
 
 	/* Restore watchdog state. */
 	writel(wdt->wtdat_save, wdt->reg_base + S3C2410_WTDAT);
