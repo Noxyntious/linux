@@ -410,12 +410,44 @@ static int max77759_charger_get_property(struct power_supply *psy,
 	return ret < 0 ? ret : 0;
 }
 
+/*
+ * Userspace may lower (or restore) the fast-charge and input current limits:
+ * the thermal policy that throttles charging when the phone is hot lives
+ * there. Neither can exceed what the hardware ranges allow.
+ */
+static int max77759_charger_set_property(struct power_supply *psy,
+					 enum power_supply_property psp,
+					 const union power_supply_propval *pval)
+{
+	struct max77759_charger *chg = power_supply_get_drvdata(psy);
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		if (pval->intval < 0)
+			return -EINVAL;
+		return set_fast_charge_current_limit(chg, pval->intval);
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		return set_input_current_limit(chg, pval->intval);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int max77759_charger_property_is_writeable(struct power_supply *psy,
+						  enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX ||
+	       psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+}
+
 static const struct power_supply_desc max77759_charger_desc = {
 	.name = "max77759-charger",
 	.type = POWER_SUPPLY_TYPE_USB,
 	.properties = max77759_charger_props,
 	.num_properties = ARRAY_SIZE(max77759_charger_props),
 	.get_property = max77759_charger_get_property,
+	.set_property = max77759_charger_set_property,
+	.property_is_writeable = max77759_charger_property_is_writeable,
 };
 
 static int charger_set_mode(struct max77759_charger *chg,

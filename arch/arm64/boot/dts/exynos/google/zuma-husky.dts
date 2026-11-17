@@ -535,7 +535,13 @@
 		charge-full-design-microamp-hours = <4950000>;
 		voltage-max-design-microvolt = <4480000>;
 		constant-charge-voltage-max-microvolt = <4400000>;
-		constant-charge-current-max-microamp = <2000000>;
+		/*
+		 * 1 A until the battery temperature is real: the fuel gauge
+		 * reports a fixed 22.0 C, so nothing throttles charging on a
+		 * hot phone (stock does, from battery and skin temperature).
+		 * Userspace may raise it through constant_charge_current_max.
+		 */
+		constant-charge-current-max-microamp = <1000000>;
 	};
 };
 
