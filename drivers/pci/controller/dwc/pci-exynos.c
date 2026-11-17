@@ -463,14 +463,20 @@ static int exynos_zuma_pcie_host_init(struct dw_pcie_rp *pp)
 
 	pp->bridge->ops = &exynos_pci_ops;
 
+	/*
+	 * Enable the PCIE_PHY control in the PMU (take the PHY out of
+	 * isolation) before touching ELBI: the core-reset read below faults
+	 * the interconnect while the PHY is isolated. At first boot the
+	 * bootloader has already released it, but a system resume comes back
+	 * from our own suspend, whose phy_power_off() re-isolated it.
+	 */
+	regmap_update_bits(ep->pmureg, ep->pmu_offset,
+			   PCIE_ZUMA_PMU_PHY_CTRL, PCIE_ZUMA_PMU_PHY_CTRL);
+
 	exynos_pcie_assert_core_reset(ep);
 
 	/* power the endpoint (e.g. Wi-Fi WLAN_EN / REG_ON) */
 	gpiod_set_value_cansleep(ep->wlan_gpio, 1);
-
-	/* enable the PCIE_PHY control in the PMU */
-	regmap_update_bits(ep->pmureg, ep->pmu_offset,
-			   PCIE_ZUMA_PMU_PHY_CTRL, PCIE_ZUMA_PMU_PHY_CTRL);
 
 	/*
 	 * Vendor ordering: bring up the PHY input clock + reference PLL first,
@@ -848,6 +854,15 @@ static int exynos_pcie_resume_noirq(struct device *dev)
 		if (ret)
 			return ret;
 	}
+
+	/*
+	 * Our suspend_noirq put the PHY back into PMU isolation; host_init
+	 * reads ELBI before it gets to phy_reset(), and that read faults
+	 * while the PHY is isolated. Release it first (host_init repeats the
+	 * reset in the vendor order).
+	 */
+	if (ep->drvdata->zuma)
+		phy_reset(ep->phy);
 
 	/* the host_init callback controls ep->phy */
 	ep->drvdata->host_ops->init(pp);
