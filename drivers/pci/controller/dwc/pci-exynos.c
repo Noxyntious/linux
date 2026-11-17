@@ -841,13 +841,15 @@ static int exynos_pcie_suspend_noirq(struct device *dev)
 	 */
 	if (ep->drvdata->zuma && ep->cp_power) {
 		/*
-		 * ...but do park a live link in an orderly way (PME_Turn_Off ->
-		 * L2, PERST, refclk kept for the CP), which the s5xxx driver's
-		 * resume reconciles ("link was parked by the RC"). Sleeping with
-		 * the link up leaves the CP active and the SoC never wakes.
+		 * The CP parks the link itself once idle (ds_det). A link that
+		 * is still up means the CP is busy: forcing it into L2 here
+		 * crashed the CP, and sleeping with it up never wakes. Refuse
+		 * the suspend; it is retried once the CP has parked.
 		 */
-		if (zumapro_pcie_modem_link_active(dev))
-			zumapro_pcie_modem_link_down(dev);
+		if (zumapro_pcie_modem_link_active(dev)) {
+			dev_info(dev, "modem link up, CP busy: suspend refused\n");
+			return -EBUSY;
+		}
 		return 0;
 	}
 
