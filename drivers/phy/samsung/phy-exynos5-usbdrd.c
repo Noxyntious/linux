@@ -618,6 +618,7 @@ struct exynos5_usbdrd_phy_drvdata {
 	const char * const *regulator_names;
 	int n_regulators;
 	u32 pmu_offset_usbdrd0_phy;
+	bool keep_link_on_exit;
 	u32 pmu_offset_usbdrd0_phy_ss;
 	u32 pmu_offset_usbdrd1_phy;
 	/*
@@ -1669,9 +1670,18 @@ static int exynos2200_usbdrd_phy_exit(struct phy *phy)
 	reg &= ~(EXYNOS2200_UTMI_FORCE_BVALID | EXYNOS2200_UTMI_FORCE_VBUSVALID);
 	writel(reg, regs_base + EXYNOS2200_DRD_UTMI);
 
-	reg = readl(regs_base + EXYNOS2200_DRD_CLKRST);
-	reg |= CLKRST_LINK_SW_RST;
-	writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
+	/*
+	 * dwc3 programs its core registers (dwc3_phy_setup()) before it calls
+	 * phy_init() again, which is what releases the link reset. On zuma a
+	 * register access to a link held in reset stalls the interconnect, so
+	 * every dwc3 resume or re-probe after an exit() hung the SoC until the
+	 * watchdog fired. Leave the link out of reset there.
+	 */
+	if (!phy_drd->drv_data->keep_link_on_exit) {
+		reg = readl(regs_base + EXYNOS2200_DRD_CLKRST);
+		reg |= CLKRST_LINK_SW_RST;
+		writel(reg, regs_base + EXYNOS2200_DRD_CLKRST);
+	}
 
 	clk_bulk_disable_unprepare(phy_drd->drv_data->n_clks, phy_drd->clks);
 
@@ -4237,6 +4247,8 @@ static const struct exynos5_usbdrd_phy_drvdata zuma_usb31drd_phy = {
 	.link_session_quirk		= true,
 	/* SuperSpeed USB-DP PMA needs its clocks held on past init() */
 	.pipe3_clk_always_on		= true,
+	/* dwc3 touches the link before phy_init() on resume */
+	.keep_link_on_exit		= true,
 	/* SuperSpeed tuning is left at PHY defaults, like the zuma DT */
 	.phy_tunes			= NULL,
 	/* clocks and regulators are specific to the underlying PHY blocks */
