@@ -51,6 +51,9 @@
 		cp2ap-cp-wrst-gpios = <&gpa7 3 GPIO_ACTIVE_HIGH>;
 		google,cp-pmic = <&cp_pmic>;
 		google,cp-dcxo = <&cp_s5910>;
+		/* vendor s5910,on_seq: <reg val>; the last one turns DCXO LPM off */
+		google,s5910-on-seq = <0x211 0x47>, <0x236 0x0e>, <0x215 0x7f>,
+				      <0x20e 0x00>;
 	};
 };
 

@@ -38,6 +38,9 @@ struct exynos_cp_power {
 	/* SPMI slaves patched after a PMIC reset; NULL if the bus is not wired */
 	struct regmap		*pmic;		/* CP PMIC, SID 0 */
 	struct regmap		*dcxo;		/* S5910 DCXO buffer, SID 5 */
+	/* google,s5910-on-seq: <reg val> pairs, empty on boards without one */
+	u32			*dcxo_on_seq;
+	int			dcxo_on_seq_len;	/* pairs */
 	bool			spmi_ready;	/* slaves resolved (lazily) */
 	bool			ever_powered_on;	/* gate the S5910 re-arm */
 };
@@ -115,22 +118,19 @@ static void exynos_cp_power_setup_spmi(struct exynos_cp_power *cp)
  * first autonomous sleep (~125 ms after ONLINE when idle) kills it.  Dump the
  * pre-state for diagnosis, then apply the vendor on_seq while the CP is held in
  * reset (downstream gpio_power_off_cp_with_s5910_on()).
+ *
+ * The sequence is the board's (google,s5910-on-seq, the vendor s5910,on_seq).
+ * Boards whose vendor DT has none -- husky's S5300 only has the shutdown
+ * s5910,seq -- leave the buffer at its defaults, as the stock kernel does.
  */
 static void exynos_cp_power_s5910_on_seq(struct exynos_cp_power *cp)
 {
-	/* komodo fdt s5910,on_seq */
-	static const struct { u16 reg; u8 val; } on_seq[] = {
-		{ 0x211, 0x47 },
-		{ 0x236, 0x0e },
-		{ 0x215, 0x7f },
-		{ 0x20e, 0x00 },	/* DCXO LPM mode off */
-	};
 	static const u16 dump_regs[] = { 0x20e, 0x211, 0x215, 0x236, 0x240 };
 	struct device *dev = cp->dev;
 	unsigned int val;
 	int i, retry, ret;
 
-	if (!cp->dcxo)
+	if (!cp->dcxo || !cp->dcxo_on_seq_len)
 		return;
 
 	for (i = 0; i < ARRAY_SIZE(dump_regs); i++) {
@@ -140,16 +140,17 @@ static void exynos_cp_power_s5910_on_seq(struct exynos_cp_power *cp)
 			dev_info(dev, "s5910 reg %#x = %#02x\n", dump_regs[i], val);
 	}
 
-	for (i = 0; i < ARRAY_SIZE(on_seq); i++) {
+	for (i = 0; i < cp->dcxo_on_seq_len; i++) {
+		u32 reg = cp->dcxo_on_seq[2 * i], v = cp->dcxo_on_seq[2 * i + 1];
+
 		for (retry = 0; retry < 2; retry++) {
-			ret = regmap_write(cp->dcxo, on_seq[i].reg, on_seq[i].val);
+			ret = regmap_write(cp->dcxo, reg, v);
 			if (!ret)
 				break;
 			msleep(2);
 		}
 		if (ret) {
-			dev_err(dev, "s5910 write %#x=%#x failed\n",
-				on_seq[i].reg, on_seq[i].val);
+			dev_err(dev, "s5910 write %#x=%#x failed\n", reg, v);
 			return;
 		}
 	}
@@ -378,6 +379,7 @@ static int exynos_cp_power_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct exynos_cp_power *cp;
+	int n;
 
 	cp = devm_kzalloc(dev, sizeof(*cp), GFP_KERNEL);
 	if (!cp)
@@ -406,6 +408,19 @@ static int exynos_cp_power_probe(struct platform_device *pdev)
 		dev_warn(dev, "no cp-dump-noti gpio (vendor clears it pre-reset)\n");
 	if (!cp->cp2ap_cp_wrst)
 		dev_warn(dev, "no cp2ap-cp-wrst gpio (reset unhandshaken)\n");
+
+	n = of_property_count_u32_elems(dev->of_node, "google,s5910-on-seq");
+	if (n > 0) {
+		if (n % 2)
+			return dev_err_probe(dev, -EINVAL,
+					     "google,s5910-on-seq needs <reg val> pairs\n");
+		cp->dcxo_on_seq = devm_kcalloc(dev, n, sizeof(u32), GFP_KERNEL);
+		if (!cp->dcxo_on_seq)
+			return -ENOMEM;
+		of_property_read_u32_array(dev->of_node, "google,s5910-on-seq",
+					   cp->dcxo_on_seq, n);
+		cp->dcxo_on_seq_len = n / 2;
+	}
 
 	/*
 	 * The SPMI slaves are resolved lazily on the first reset, not here, so

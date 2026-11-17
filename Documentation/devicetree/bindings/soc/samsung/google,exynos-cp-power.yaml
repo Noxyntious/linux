@@ -55,6 +55,17 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: Phandle to the S5910 DCXO clock-buffer SPMI device.
 
+  google,s5910-on-seq:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: S5910 register
+        - description: value written to it
+    description:
+      The S5910 power-on sequence (vendor s5910,on_seq), written while the CP
+      is held in reset. Boards whose vendor DT has none, such as the Pixel 8's
+      S5300, leave the buffer at its defaults.
+
 required:
   - compatible
   - cp-pwr-gpios
