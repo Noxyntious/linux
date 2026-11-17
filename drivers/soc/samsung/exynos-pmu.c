@@ -546,6 +546,16 @@ static const struct {
 	{ 0x3970, GS101_WAKEUP2_INT_EN, 0x0, 0x1f0 },
 };
 
+/*
+ * Zuma (Tensor G3) has a ninth core, so its per-core GIC wake bits run 20-28
+ * rather than 20-27, and its SYS_SLEEP sources add bit 13 (EXT_PCIE_GEN3_1L0)
+ * -- downstream zuma.dtsi exynos-pm wakeup_int_en = <0x1f0bf 0x01f0>.
+ */
+#define ZUMA_TOP_SICD_MASK	0x1ff00000
+#define ZUMA_TOP_SLEEP_MASK	0x1f0bf
+
+static bool zumapro_is_zuma;
+
 static void zumapro_set_wakeup_mask(bool arm)
 {
 	bool deep = pm_suspend_target_state == PM_SUSPEND_MEM;
@@ -554,6 +564,9 @@ static void zumapro_set_wakeup_mask(bool arm)
 	for (i = 0; i < ARRAY_SIZE(zumapro_wakeup_mask); i++) {
 		u32 mask = deep ? zumapro_wakeup_mask[i].sleep_mask
 				: zumapro_wakeup_mask[i].sicd_mask;
+
+		if (zumapro_is_zuma && i == 0)
+			mask = deep ? ZUMA_TOP_SLEEP_MASK : ZUMA_TOP_SICD_MASK;
 
 		regmap_write(pmu_context->pmureg,
 			     zumapro_wakeup_mask[i].stat_reg, 0);
@@ -835,6 +848,11 @@ static void zumapro_enable_dsu_drcg(struct device *dev)
 
 /* tegu cluster membership: cluster0 = {0-3}, cluster1 = {4-6}, cluster2 = {7} */
 static const u8 zumapro_cpu_cluster[] = { 0, 0, 0, 0, 1, 1, 1, 2 };
+/* zuma (Tensor G3): cluster0 = {0-3}, cluster1 = {4-7}, cluster2 = {8} */
+static const u8 zuma_cpu_cluster[] = { 0, 0, 0, 0, 1, 1, 1, 1, 2 };
+
+static const u8 *sleep_cpu_cluster = zumapro_cpu_cluster;
+static unsigned int sleep_nr_cpus = ARRAY_SIZE(zumapro_cpu_cluster);
 
 /*
  * Set while a suspend-to-RAM is in flight, for the hotplug hints below.  Unlike
@@ -972,12 +990,12 @@ static int zumapro_cpuhp_sleep_hint_set(unsigned int cpu)
 	bool cluster_last = true;
 	int c;
 
-	if (!zumapro_in_sys_sleep || cpu >= ARRAY_SIZE(zumapro_cpu_cluster))
+	if (!zumapro_in_sys_sleep || cpu >= sleep_nr_cpus)
 		return 0;
 
 	for_each_online_cpu(c) {
-		if (c != cpu && c < ARRAY_SIZE(zumapro_cpu_cluster) &&
-		    zumapro_cpu_cluster[c] == zumapro_cpu_cluster[cpu]) {
+		if (c != cpu && c < sleep_nr_cpus &&
+		    sleep_cpu_cluster[c] == sleep_cpu_cluster[cpu]) {
 			cluster_last = false;
 			break;
 		}
@@ -990,7 +1008,7 @@ static int zumapro_cpuhp_sleep_hint_set(unsigned int cpu)
 
 static int zumapro_cpuhp_sleep_hint_clear(unsigned int cpu)
 {
-	if (zumapro_in_sys_sleep && cpu < ARRAY_SIZE(zumapro_cpu_cluster))
+	if (zumapro_in_sys_sleep && cpu < sleep_nr_cpus)
 		regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpu),
 			     CPU_INFORM_CLEAR);
 	return 0;
@@ -1331,6 +1349,12 @@ static int exynos_pmu_probe(struct platform_device *pdev)
 		dev_info(dev, "PMU_INFORM0 C2-allow: ret=%d readback=0x%x\n",
 			 ret, inform0);
 
+		if (of_machine_is_compatible("google,zuma")) {
+			zumapro_is_zuma = true;
+			sleep_cpu_cluster = zuma_cpu_cluster;
+			sleep_nr_cpus = ARRAY_SIZE(zuma_cpu_cluster);
+		}
+
 		zumapro_enable_dsu_drcg(dev);
 
 		/*
@@ -1436,7 +1460,7 @@ static int exynos_cpupm_resume_noirq(struct device *dev)
 	 * offset is not CPU_INFORM at all.
 	 */
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_sicd_wakeup) {
-		for (cpu = 0; cpu < ARRAY_SIZE(zumapro_cpu_cluster); cpu++)
+		for (cpu = 0; cpu < sleep_nr_cpus; cpu++)
 			regmap_write(pmu_context->pmureg,
 				     GS101_CPU_INFORM(cpu), CPU_INFORM_CLEAR);
 		cpumask_clear(&zumapro_hinted_cpus);
