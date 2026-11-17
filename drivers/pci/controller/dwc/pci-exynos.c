@@ -833,6 +833,25 @@ static int exynos_pcie_suspend_noirq(struct device *dev)
 	struct exynos_pcie *ep = dev_get_drvdata(dev);
 
 	/*
+	 * The modem RC belongs to the s5xxx driver: it parks the link and
+	 * drops AP_ACTIVE itself (s5xxx_suspend_noirq), and relinks from its
+	 * own worker on resume. Isolating this PHY cuts the external PLL that
+	 * clocks the discrete CP, after which the firmware's SYS_SLEEP resets
+	 * the SoC. Leave it alone, as downstream does for a parked modem RC.
+	 */
+	if (ep->drvdata->zuma && ep->cp_power) {
+		/*
+		 * ...but do park a live link in an orderly way (PME_Turn_Off ->
+		 * L2, PERST, refclk kept for the CP), which the s5xxx driver's
+		 * resume reconciles ("link was parked by the RC"). Sleeping with
+		 * the link up leaves the CP active and the SoC never wakes.
+		 */
+		if (zumapro_pcie_modem_link_active(dev))
+			zumapro_pcie_modem_link_down(dev);
+		return 0;
+	}
+
+	/*
 	 * Wi-Fi RC (the one with a WLAN_EN line): power the endpoint off
 	 * across the sleep, so that resume repeats the cold bring-up of probe
 	 * (WLAN_EN, then PERST release in start_link). A chip that stays up
@@ -869,6 +888,10 @@ static int exynos_pcie_resume_noirq(struct device *dev)
 		if (ret)
 			return ret;
 	}
+
+	/* the modem RC is resumed by the s5xxx driver (see suspend_noirq) */
+	if (ep->drvdata->zuma && ep->cp_power)
+		return 0;
 
 	/*
 	 * Our suspend_noirq put the PHY back into PMU isolation; host_init
