@@ -1329,7 +1329,8 @@ static int samsung_pinctrl_probe(struct platform_device *pdev)
 	 * consumers start resuming at noirq, so restore all Zumapro banks from
 	 * syscore, as the downstream driver does, rather than at resume_early.
 	 */
-	if (of_device_is_compatible(dev->of_node, "google,zumapro-pinctrl"))
+	if (of_device_is_compatible(dev->of_node, "google,zumapro-pinctrl") ||
+	    of_device_is_compatible(dev->of_node, "google,zuma-pinctrl"))
 		list_add_tail(&drvdata->node, &samsung_pinctrl_syscore_list);
 
 	return 0;
