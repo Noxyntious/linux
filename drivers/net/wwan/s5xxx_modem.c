@@ -589,6 +589,8 @@ struct s5xxx_modem {
 	void __iomem		*pktproc;
 
 	u32			db_bus_addr;
+	/* samsung,doorbell-in-bar0: the vendor layout, see s5xxx_program_doorbell_bar() */
+	bool			db_in_bar0;
 	void __iomem		*doorbell;
 
 	const struct firmware	*pbl;
@@ -754,10 +756,15 @@ static const char *s5xxx_fw_path(struct s5xxx_modem *sm, char *buf,
  * so the hardware aligns the programmed address down; any base that still
  * decodes the doorbell bus address is fine.
  */
+static int s5xxx_program_doorbell_bar_vendor(struct s5xxx_modem *sm);
+
 static int s5xxx_program_doorbell_bar(struct s5xxx_modem *sm)
 {
 	u32 val = 0, base;
 	int try;
+
+	if (sm->db_in_bar0)
+		return s5xxx_program_doorbell_bar_vendor(sm);
 
 	for (try = 0; try < 10; try++) {
 		pci_write_config_dword(sm->pdev, PCI_BASE_ADDRESS_0,
@@ -804,6 +811,42 @@ static int s5xxx_program_doorbell_bar(struct s5xxx_modem *sm)
 
 	dev_err(sm->dev, "doorbell BAR won't hold %#x (reads %#x)\n",
 		S5XXX_CP_BAR0_BUS, val);
+	return -EIO;
+}
+
+/*
+ * The vendor layout (downstream s51xx_pcie_probe(), and what the Pixel 8's
+ * S5300 needs): BAR0 is programmed to the DT doorbell address itself, the
+ * ROM-phase BAR is 1M so the hardware aligns it down, and the doorbell is
+ * rung at the DT address -- an offset into the BAR, 0x60000 on husky, not
+ * its base.  Ringing the base of a BAR moved elsewhere (the AOC layout above)
+ * reads back all-ones and the ROM never leaves boot_stage 0.  No other BAR
+ * is assigned: BAR2 at 0x14e00000 would overlap this BAR0.  Whether the
+ * Pixel 8's AOC needs CP windows for call audio is still open.
+ */
+static int s5xxx_program_doorbell_bar_vendor(struct s5xxx_modem *sm)
+{
+	u32 db = sm->db_bus_addr, val = 0, base;
+	int try;
+
+	for (try = 0; try < 10; try++) {
+		pci_write_config_dword(sm->pdev, PCI_BASE_ADDRESS_0, db);
+		pci_write_config_dword(sm->pdev, PCI_BASE_ADDRESS_1, 0);
+		pci_read_config_dword(sm->pdev, PCI_BASE_ADDRESS_0, &val);
+		base = val & PCI_BASE_ADDRESS_MEM_MASK;
+		if (base && base <= db && db - base < SZ_1M) {
+			if (try)
+				dev_warn(sm->dev,
+					 "doorbell BAR stuck after %d retries (%#x)\n",
+					 try, val);
+			dev_dbg(sm->dev, "BAR0 %#x, doorbell +%#x\n", base,
+				db - base);
+			return 0;
+		}
+		udelay(100);
+	}
+
+	dev_err(sm->dev, "doorbell BAR won't hold %#x (reads %#x)\n", db, val);
 	return -EIO;
 }
 
@@ -4927,6 +4970,8 @@ static int s5xxx_probe(struct platform_device *pdev)
 		dev_err_probe(dev, ret, "missing samsung,doorbell-addr\n");
 		goto err_rc;
 	}
+	sm->db_in_bar0 = of_property_read_bool(dev->of_node,
+					       "samsung,doorbell-in-bar0");
 
 	sm->cp2ap_wakeup = devm_gpiod_get(dev, "cp2ap-wakeup", GPIOD_IN);
 	if (IS_ERR(sm->cp2ap_wakeup)) {

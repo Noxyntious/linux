@@ -69,6 +69,14 @@ properties:
       (deasserted) or MAIN samples it as a partial-reset request and
       self-resets after ONLINE.  Optional.
 
+  samsung,doorbell-in-bar0:
+    type: boolean
+    description:
+      Program BAR0 to the doorbell address itself and ring the doorbell there,
+      as the vendor driver does (the Pixel 8's S5300, whose 1M ROM-phase BAR0
+      puts the doorbell at an offset into it). Without it, BAR0 and BAR2 take
+      the layout the Pixel 9's AOC expects.
+
 required:
   - compatible
   - memory-region
