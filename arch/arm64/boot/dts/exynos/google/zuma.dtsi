@@ -441,3 +441,20 @@
 &gpu_opp_table {
 	/delete-node/ opp-940000000;
 };
+
+&soc {
+	/*
+	 * BLK_HSI2 DMA firewall (UFS, Wi-Fi PCIe). Out of reset an S2MPU blocks
+	 * its master outright, and SYS_SLEEP resets it: without this node the
+	 * UFS host's first DMA after a deep sleep is a system-bus fatal error
+	 * (SBFES) and the disk never comes back. The block is always on, so the
+	 * driver reinstalls the table from resume_early, before the consumers.
+	 * Address from downstream zuma-s2mpu.dtsi.
+	 */
+	s2mpu_s0_hsi2: s2mpu@131f0000 {
+		compatible = "google,s2mpu-v9";
+		reg = <0x131f0000 0x10000>;
+		#access-controller-cells = <0>;
+	};
+};
+

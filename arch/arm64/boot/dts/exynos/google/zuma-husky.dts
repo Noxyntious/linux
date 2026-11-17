@@ -137,18 +137,21 @@
 			label = "KEY_VOLUMEDOWN";
 			linux,code = <KEY_VOLUMEDOWN>;
 			gpios = <&gpa4 1 GPIO_ACTIVE_LOW>;
+			wakeup-source;
 		};
 
 		button-vol-up {
 			label = "KEY_VOLUMEUP";
 			linux,code = <KEY_VOLUMEUP>;
 			gpios = <&gpa6 2 GPIO_ACTIVE_LOW>;
+			wakeup-source;
 		};
 
 		button-power {
 			label = "KEY_POWER";
 			linux,code = <KEY_POWER>;
 			gpios = <&gpa4 0 GPIO_ACTIVE_LOW>;
+			wakeup-source;
 		};
 	};
 
@@ -401,6 +404,8 @@
 		compatible = "samsung,s2mpg14-pmic";
 		interrupt-parent = <&gic>;
 		interrupts = <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH 0>;
+		/* RTC alarm wakes the system (as on the Pixel 9 boards) */
+		wakeup-source;
 
 		regulators {
 			m_ldo4_reg: ldo4m {
@@ -1151,4 +1156,14 @@
  */
 &dpu_fb_pool {
 	size = <0x20000000>;
+};
+
+/*
+ * The USB controller and its combo PHY live in BLK_HSI0 but are not attached
+ * to pd_hsi0, so genpd powers the block off in system suspend with them still
+ * bound; the dwc3 resume then touches a block that lost all its state and
+ * stalls the bus (watchdog reset). Keep HSI0 up until USB is a real consumer.
+ */
+&pd_hsi0 {
+	samsung,always-on;
 };
