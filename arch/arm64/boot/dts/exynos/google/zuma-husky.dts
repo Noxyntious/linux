@@ -550,6 +550,31 @@
 	};
 };
 
+/*
+ * CP->AP lines, as the stock modemif overlay sets them (s5100_cp2ap_*).
+ * CP2AP_WAKEUP has a pull-down: a parked CP may stop driving it, and without
+ * the pull the line floats -- across SYS_SLEEP it read high and woke the AP
+ * within ~30 ms of every suspend.
+ */
+&pinctrl_gpio_alive {
+	cp2ap_wakeup_pin: cp2ap-wakeup-pins {
+		samsung,pins = "gpa6-5";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_DOWN>;
+	};
+
+	cp2ap_phone_active_pin: cp2ap-phone-active-pins {
+		samsung,pins = "gpa7-0";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+
+	cp2ap_ps_hold_pin: cp2ap-ps-hold-pins {
+		samsung,pins = "gpa6-4";
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+	};
+};
+
 &pinctrl_gpio_alive {
 	if_pmic_int: if-pmic-int-pins {
 		samsung,pins = "gpa8-0";
@@ -802,6 +827,8 @@
 		samsung,doorbell-in-bar0;
 		cp2ap-wakeup-gpios = <&gpa6 5 GPIO_ACTIVE_HIGH>;
 		cp2ap-active-gpios = <&gpa7 0 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cp2ap_wakeup_pin &cp2ap_phone_active_pin &cp2ap_ps_hold_pin>;
 	};
 };
 
