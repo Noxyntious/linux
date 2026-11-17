@@ -760,6 +760,8 @@
 
 	cp_power: cp-power {
 		compatible = "google,exynos-cp-power";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cp_ctrl>;
 		cp-pwr-gpios = <&gph1 2 GPIO_ACTIVE_HIGH>;
 		cp-nreset-gpios = <&gph1 7 GPIO_ACTIVE_HIGH>;
 		cp-pm-wrst-gpios = <&gpa0 2 GPIO_ACTIVE_HIGH>;
@@ -1051,6 +1053,22 @@
 };
 
 &pinctrl_hsi1 {
+	/*
+	 * AP->CP control lines (CP power, resets, PDA_ACTIVE, AP2CP_WAKEUP,
+	 * dump notify). HSI1 pin banks are not alive: in SYS_SLEEP each pad
+	 * takes its CON_PDN state, whose reset value drives 0 - CP_PWR and
+	 * CP_NRESET fell and the CP was reset in every deep sleep ("CP
+	 * CRASHED" on resume). Hold the previous level instead.
+	 */
+	cp_ctrl: cp-ctrl-pins {
+		samsung,pins = "gph1-0", "gph1-1", "gph1-2", "gph1-7",
+			       "gph0-2", "gph0-3";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-con-pdn = <GS101_PIN_PDN_PREV>;
+		samsung,pin-pud-pdn = <GS101_PIN_PULL_NONE>;
+	};
+
 	hapt_amp_rst: hapt-amp-rst-pins {
 		samsung,pins = "gph2-3";
 		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
