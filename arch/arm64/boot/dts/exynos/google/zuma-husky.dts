@@ -627,6 +627,15 @@
 		/* maxim,rsense-default 500 (10 uOhm units) */
 		shunt-resistor-micro-ohms = <5000>;
 		monitored-battery = <&battery>;
+		/*
+		 * Battery thermistor, as husky's vendor battery profile
+		 * (zuma-husky-battery-data.dtsi: TGain, TOff, Curve). Without
+		 * it the gauge stays in host-temperature mode with a stale
+		 * 22.0 C and nothing throttles charging on a hot phone.
+		 */
+		maxim,thermistor-tgain = <0xed51>;
+		maxim,thermistor-toff = <0x1eba>;
+		maxim,thermistor-curve = <0x0014>;
 	};
 
 	pmic@66 {

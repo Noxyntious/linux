@@ -1236,6 +1236,43 @@ static irqreturn_t max17042_thread_handler(int id, void *dev)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Battery thermistor: TGain/TOff (and on M5 gauges the Curve register) turn the
+ * thermistor reading into a temperature, and Config.TEx selects whether the
+ * gauge measures it at all or expects the host to write Temp. A bootloader may
+ * leave TEx set with a stale Temp (husky: a fixed 22.0 C) for a vendor driver
+ * that restores the battery profile; without one nothing ever updates Temp, so
+ * program the thermistor from the DT and let the gauge measure it. Volatile
+ * registers only: the cell model is not touched.
+ */
+#define MAX17042_CONFIG_TEX	BIT(8)
+
+static void max17042_setup_thermistor(struct max17042_chip *chip)
+{
+	struct device_node *np = chip->dev->of_node;
+	struct regmap *map = chip->regmap;
+	u32 tgain, toff, curve;
+	int ret;
+
+	if (!np || of_property_read_u32(np, "maxim,thermistor-tgain", &tgain) ||
+	    of_property_read_u32(np, "maxim,thermistor-toff", &toff))
+		return;
+
+	ret = regmap_write(map, MAX17042_TGAIN, tgain & 0xffff);
+	if (!ret)
+		ret = regmap_write(map, MAX17042_TOFF, toff & 0xffff);
+	if (!ret && !of_property_read_u32(np, "maxim,thermistor-curve", &curve))
+		ret = regmap_write(map, MAX17055_Curve, curve & 0xffff);
+	if (!ret)
+		ret = regmap_update_bits(map, MAX17042_CONFIG,
+					 MAX17042_CONFIG_TEX, 0);
+	if (ret)
+		dev_warn(chip->dev, "thermistor setup failed: %d\n", ret);
+	else
+		dev_info(chip->dev, "measuring the battery thermistor (TGain %#x TOff %#x)\n",
+			 tgain & 0xffff, toff & 0xffff);
+}
+
 static void max17042_init_worker(struct work_struct *work)
 {
 	struct max17042_chip *chip = container_of(to_delayed_work(work),
@@ -1643,6 +1680,8 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
 	} else {
 		WRITE_ONCE(chip->init_complete, true);
 	}
+
+	max17042_setup_thermistor(chip);
 
 	return 0;
 }

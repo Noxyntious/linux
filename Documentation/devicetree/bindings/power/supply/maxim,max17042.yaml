@@ -67,6 +67,23 @@ properties:
       Voltage threshold to report battery as over voltage (in mV).
       Default is not to report over-voltage events.
 
+  maxim,thermistor-tgain:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 0xffff
+    description:
+      TGain for the battery thermistor (with maxim,thermistor-toff). When both
+      are given the gauge is set to measure the thermistor (Config.TEx cleared).
+
+  maxim,thermistor-toff:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 0xffff
+    description: TOff for the battery thermistor.
+
+  maxim,thermistor-curve:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 0xffff
+    description: Thermistor Curve register (M5 gauges such as the MAX77759).
+
 required:
   - compatible
   - reg
