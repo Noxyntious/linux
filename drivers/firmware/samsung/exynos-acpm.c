@@ -174,6 +174,8 @@ struct acpm_chan {
 struct acpm_info {
 	struct acpm_shmem __iomem *shmem;
 	void __iomem *sram_base;
+	resource_size_t sram_size;
+	atomic_t dumped;
 	struct acpm_chan *chans;
 	struct device *dev;
 	struct acpm_handle handle;
@@ -346,6 +348,83 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
  *
  * Return: 0 on success, -errno otherwise.
  */
+/*
+ * Framework header words after the channel table (vendor acpm_framework):
+ * SRAM offsets of the firmware log ring's rear and front indices, its
+ * entries, the entry size and the number of entries, and of a timestamp the
+ * firmware keeps current.
+ */
+#define ACPM_FW_KTIME_OFS	48
+#define ACPM_FW_LOG_REAR_OFS	52
+#define ACPM_FW_LOG_FRONT_OFS	56
+#define ACPM_FW_LOG_DATA_OFS	60
+#define ACPM_FW_LOG_ESIZE_OFS	64
+#define ACPM_FW_LOG_LEN_OFS	68
+#define ACPM_FW_LOG_DUMP	64
+
+static bool acpm_sram_ok(struct acpm_info *acpm, u32 ofs, u32 len)
+{
+	return ofs < acpm->sram_size && len <= acpm->sram_size - ofs;
+}
+
+/*
+ * Diagnostics for the firmware going silent (every later IPC times out and
+ * the watchdog eventually resets the SoC): print, once per boot, the queue
+ * indices of every channel -- a reply ring with (front + 1) % qlen == rear is
+ * the firmware's "qfull", which parks the plugin -- whether the firmware's
+ * clock still moves, and the newest raw firmware log entries.
+ */
+static void acpm_dump_state(struct acpm_info *acpm, const char *why)
+{
+	void __iomem *hdr = (void __iomem *)acpm->shmem;
+	struct device *dev = acpm->dev;
+	u32 kt, rear_ofs, data_ofs, esz, len, rear, kt0, kt1;
+	int i;
+
+	if (atomic_xchg(&acpm->dumped, 1))
+		return;
+
+	dev_err(dev, "ACPM state dump (%s):\n", why);
+	for (i = 0; i < acpm->num_chans; i++) {
+		struct acpm_chan *c = &acpm->chans[i];
+
+		dev_err(dev,
+			" ch%u q%u tx f%u r%u rx f%u r%u seq %u bitmap %lx\n",
+			c->id, c->qlen, readl(c->tx.front), readl(c->tx.rear),
+			readl(c->rx.front), readl(c->rx.rear), c->seqnum,
+			c->bitmap_seqnum[0]);
+	}
+
+	kt = readl(hdr + ACPM_FW_KTIME_OFS);
+	if (acpm_sram_ok(acpm, kt, 8)) {
+		kt0 = readl(acpm->sram_base + kt + 4);
+		mdelay(20);
+		kt1 = readl(acpm->sram_base + kt + 4);
+		dev_err(dev, " fw clock %#x -> %#x over 20 ms\n", kt0, kt1);
+	}
+
+	rear_ofs = readl(hdr + ACPM_FW_LOG_REAR_OFS);
+	data_ofs = readl(hdr + ACPM_FW_LOG_DATA_OFS);
+	esz = readl(hdr + ACPM_FW_LOG_ESIZE_OFS);
+	len = readl(hdr + ACPM_FW_LOG_LEN_OFS);
+	if (esz != 16 || !len || !acpm_sram_ok(acpm, rear_ofs, 8) ||
+	    !acpm_sram_ok(acpm, data_ofs, esz * len)) {
+		dev_err(dev, " fw log: unexpected layout %#x %#x %u %u\n",
+			rear_ofs, data_ofs, esz, len);
+		return;
+	}
+	rear = readl(acpm->sram_base + rear_ofs);
+	dev_err(dev, " fw log rear %u front %u, newest %u:\n", rear,
+		readl(acpm->sram_base + rear_ofs + 4), ACPM_FW_LOG_DUMP);
+	for (i = ACPM_FW_LOG_DUMP; i > 0; i--) {
+		u32 idx = (rear + len - i % len) % len;
+		void __iomem *e = acpm->sram_base + data_ofs + idx * esz;
+
+		dev_err(dev, " fw %4u: %08x %08x %08x %08x\n", idx, readl(e),
+			readl(e + 4), readl(e + 8), readl(e + 12));
+	}
+}
+
 static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 				   const struct acpm_xfer *xfer)
 {
@@ -385,6 +464,7 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 
 	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
 		achan->id, seqnum, achan->bitmap_seqnum[0]);
+	acpm_dump_state(achan->acpm, "IPC timeout");
 
 	return -ETIME;
 }
@@ -411,6 +491,7 @@ static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front)
 				 ACPM_TX_TIMEOUT_US);
 	if (ret) {
 		dev_err(achan->acpm->dev, "RX front can not keep up with TX front.\n");
+		acpm_dump_state(achan->acpm, "RX front stuck");
 		return ret;
 	}
 
@@ -800,6 +881,7 @@ static int acpm_probe(struct platform_device *pdev)
 				     "Failed to get shared memory.\n");
 
 	size = resource_size(&res);
+	acpm->sram_size = size;
 	acpm->sram_base = devm_ioremap(dev, res.start, size);
 	if (!acpm->sram_base)
 		return dev_err_probe(dev, -ENOMEM,
