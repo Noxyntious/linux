@@ -25,6 +25,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
+#include <linux/panic.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -176,6 +177,7 @@ struct acpm_info {
 	void __iomem *sram_base;
 	resource_size_t sram_size;
 	atomic_t dumped;
+	atomic64_t last_ok;	/* ktime_get() ns of the newest reply */
 	struct acpm_chan *chans;
 	struct device *dev;
 	struct acpm_handle handle;
@@ -361,10 +363,136 @@ static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
 #define ACPM_FW_LOG_ESIZE_OFS	64
 #define ACPM_FW_LOG_LEN_OFS	68
 #define ACPM_FW_LOG_DUMP	64
+/* framework header, after build_info (u32 words 23..35) */
+#define ACPM_FW_PLUGINS_OFS	0
+#define ACPM_FW_NUM_PLUGINS_OFS	4
+#define ACPM_FW_PLOG_REAR_OFS	0xa8
+#define ACPM_FW_PLOG_DATA_OFS	0xb0
+#define ACPM_FW_PLOG_LEN_OFS	0xb4
+#define ACPM_FW_PLOG_DUMP	32
+/* struct plugin (48 bytes), plugin_ops: 4 handlers + build_info + buffers */
+#define ACPM_PLUGIN_SIZE	48
+#define ACPM_PLUGIN_OPS_OFS	12
+#define ACPM_POPS_INFO_OFS	16
+#define ACPM_POPS_BUFFERS_OFS	(16 + 52)
 
 static bool acpm_sram_ok(struct acpm_info *acpm, u32 ofs, u32 len)
 {
 	return ofs < acpm->sram_size && len <= acpm->sram_size - ofs;
+}
+
+static u32 acpm_rd(struct acpm_info *acpm, u32 ofs)
+{
+	return acpm_sram_ok(acpm, ofs & ~3, 4) ? readl(acpm->sram_base + (ofs & ~3)) : 0;
+}
+
+/* copy a firmware C string (log format, buffer name) out of SRAM */
+static void acpm_fw_str(struct acpm_info *acpm, u32 ofs, char *buf, int len)
+{
+	int i;
+
+	for (i = 0; i < len - 1 && acpm_sram_ok(acpm, ofs + i, 1); i++) {
+		char c = readb(acpm->sram_base + ofs + i);
+
+		if (!c)
+			break;
+		buf[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+	}
+	buf[i] = 0;
+}
+
+/*
+ * Look a named plugin buffer up the way the vendor acpm_get_buffer() does:
+ * every plugin_ops with build_info.major >= 1 heads a list of
+ * { size, address, next, name[12] }.
+ */
+static bool acpm_find_buf(struct acpm_info *acpm, const char *name, u32 *addr,
+			  u32 *size)
+{
+	void __iomem *hdr = (void __iomem *)acpm->shmem;
+	u32 plugins = readl(hdr + ACPM_FW_PLUGINS_OFS);
+	u32 n = readl(hdr + ACPM_FW_NUM_PLUGINS_OFS);
+	char nm[13];
+	u32 i, pops, next, hops;
+
+	for (i = 0; i < n && i < 32; i++) {
+		pops = acpm_rd(acpm, plugins + i * ACPM_PLUGIN_SIZE +
+			       ACPM_PLUGIN_OPS_OFS);
+		if (!pops || !acpm_sram_ok(acpm, pops, ACPM_POPS_BUFFERS_OFS + 4))
+			continue;
+		/* build_version[47] == 0 and major >= 1 */
+		if ((acpm_rd(acpm, pops + ACPM_POPS_INFO_OFS + 44) >> 24) ||
+		    !(acpm_rd(acpm, pops + ACPM_POPS_INFO_OFS + 48) & 0xff))
+			continue;
+		next = acpm_rd(acpm, pops + ACPM_POPS_BUFFERS_OFS);
+		for (hops = 0; next && hops < 32; hops++) {
+			if (!acpm_sram_ok(acpm, next, 24))
+				break;
+			acpm_fw_str(acpm, next + 12, nm, sizeof(nm));
+			if (!strcmp(nm, name)) {
+				*size = acpm_rd(acpm, next);
+				*addr = acpm_rd(acpm, next + 4);
+				return acpm_sram_ok(acpm, *addr, *size);
+			}
+			next = acpm_rd(acpm, next + 8);
+		}
+	}
+	return false;
+}
+
+/*
+ * Firmware log entry: head [31:28] plugin id, [23:0] systick[23:0];
+ * arg0 systick[55:24]; arg1 SRAM offset of the format string; arg2 value.
+ */
+static void acpm_dump_log(struct acpm_info *acpm, const char *what, u32 front_ofs,
+			  u32 data_ofs, u32 len, u32 count)
+{
+	struct device *dev = acpm->dev;
+	u32 front, i;
+	char str[25];
+
+	if (!len || !acpm_sram_ok(acpm, front_ofs, 4) ||
+	    !acpm_sram_ok(acpm, data_ofs, 16 * len)) {
+		dev_err(dev, " %s: unexpected layout %#x %#x %u\n", what,
+			front_ofs, data_ofs, len);
+		return;
+	}
+	front = readl(acpm->sram_base + front_ofs);
+	dev_err(dev, " %s front %u len %u, newest %u:\n", what, front, len, count);
+	for (i = count; i > 0; i--) {
+		u32 idx = (front % len + len - i % len) % len;
+		void __iomem *e = acpm->sram_base + data_ofs + idx * 16;
+		u32 head = readl(e), t_hi = readl(e + 4), fmt = readl(e + 8);
+		u32 val = readl(e + 12);
+
+		if (!head && !t_hi && !fmt && !val)
+			continue;
+		acpm_fw_str(acpm, fmt & 0xffffff, str, sizeof(str));
+		dev_err(dev, "  %4u: p%u %02x t %08x%06x %-24s %#x\n", idx,
+			head >> 28, (head >> 24) & 0xf, t_hi, head & 0xffffff,
+			str, val);
+	}
+}
+
+/* FLEXPMU_DBG: 16-byte lines, 8-char tag + two words */
+static void acpm_dump_flexpmu(struct acpm_info *acpm)
+{
+	struct device *dev = acpm->dev;
+	u32 addr, size, l;
+	char tag[9];
+
+	if (!acpm_find_buf(acpm, "FLEXPMU_DBG", &addr, &size)) {
+		dev_err(dev, " FLEXPMU_DBG not found\n");
+		return;
+	}
+	dev_err(dev, " FLEXPMU_DBG @%#x:\n", addr);
+	for (l = 0; l < size / 16 && l < 42; l++) {
+		u32 a = addr + l * 16;
+
+		acpm_fw_str(acpm, a, tag, sizeof(tag));
+		dev_err(dev, "  %2u %-8s %08x %08x\n", l, tag,
+			acpm_rd(acpm, a + 8), acpm_rd(acpm, a + 12));
+	}
 }
 
 /*
@@ -374,26 +502,43 @@ static bool acpm_sram_ok(struct acpm_info *acpm, u32 ofs, u32 len)
  * the firmware's "qfull", which parks the plugin -- whether the firmware's
  * clock still moves, and the newest raw firmware log entries.
  */
-static void acpm_dump_state(struct acpm_info *acpm, const char *why)
+static void acpm_dump_chan(struct acpm_chan *c)
+{
+	dev_err(c->acpm->dev,
+		" ch%u q%u tx f%u r%u rx f%u r%u seq %u bitmap %lx\n",
+		c->id, c->qlen, readl(c->tx.front), readl(c->tx.rear),
+		readl(c->rx.front), readl(c->rx.rear), c->seqnum,
+		c->bitmap_seqnum[0]);
+}
+
+static void acpm_dump_state(struct acpm_info *acpm, struct acpm_chan *failed,
+			    const char *why)
 {
 	void __iomem *hdr = (void __iomem *)acpm->shmem;
 	struct device *dev = acpm->dev;
-	u32 kt, rear_ofs, data_ofs, esz, len, rear, kt0, kt1;
+	u32 kt, rear_ofs, data_ofs, esz, len, kt0, kt1;
 	int i;
 
 	if (atomic_xchg(&acpm->dumped, 1))
 		return;
 
-	dev_err(dev, "ACPM state dump (%s):\n", why);
-	for (i = 0; i < acpm->num_chans; i++) {
-		struct acpm_chan *c = &acpm->chans[i];
+	dev_err(dev, "ACPM state dump (%s, ch%u):\n", why, failed->id);
 
-		dev_err(dev,
-			" ch%u q%u tx f%u r%u rx f%u r%u seq %u bitmap %lx\n",
-			c->id, c->qlen, readl(c->tx.front), readl(c->tx.rear),
-			readl(c->rx.front), readl(c->rx.rear), c->seqnum,
-			c->bitmap_seqnum[0]);
-	}
+	/* the firmware's own logs first: the most useful part */
+	rear_ofs = readl(hdr + ACPM_FW_LOG_REAR_OFS);
+	data_ofs = readl(hdr + ACPM_FW_LOG_DATA_OFS);
+	esz = readl(hdr + ACPM_FW_LOG_ESIZE_OFS);
+	len = readl(hdr + ACPM_FW_LOG_LEN_OFS);
+	if (esz == 16)
+		acpm_dump_log(acpm, "fw log", rear_ofs + 4, data_ofs, len,
+			      ACPM_FW_LOG_DUMP);
+	else
+		dev_err(dev, " fw log: entry size %u\n", esz);
+	rear_ofs = readl(hdr + ACPM_FW_PLOG_REAR_OFS);
+	acpm_dump_log(acpm, "fw preempt log", rear_ofs + 4,
+		      readl(hdr + ACPM_FW_PLOG_DATA_OFS),
+		      readl(hdr + ACPM_FW_PLOG_LEN_OFS), ACPM_FW_PLOG_DUMP);
+	acpm_dump_flexpmu(acpm);
 
 	kt = readl(hdr + ACPM_FW_KTIME_OFS);
 	if (acpm_sram_ok(acpm, kt, 8)) {
@@ -403,26 +548,42 @@ static void acpm_dump_state(struct acpm_info *acpm, const char *why)
 		dev_err(dev, " fw clock %#x -> %#x over 20 ms\n", kt0, kt1);
 	}
 
-	rear_ofs = readl(hdr + ACPM_FW_LOG_REAR_OFS);
-	data_ofs = readl(hdr + ACPM_FW_LOG_DATA_OFS);
-	esz = readl(hdr + ACPM_FW_LOG_ESIZE_OFS);
-	len = readl(hdr + ACPM_FW_LOG_LEN_OFS);
-	if (esz != 16 || !len || !acpm_sram_ok(acpm, rear_ofs, 8) ||
-	    !acpm_sram_ok(acpm, data_ofs, esz * len)) {
-		dev_err(dev, " fw log: unexpected layout %#x %#x %u %u\n",
-			rear_ofs, data_ofs, esz, len);
-		return;
-	}
-	rear = readl(acpm->sram_base + rear_ofs);
-	dev_err(dev, " fw log rear %u front %u, newest %u:\n", rear,
-		readl(acpm->sram_base + rear_ofs + 4), ACPM_FW_LOG_DUMP);
-	for (i = ACPM_FW_LOG_DUMP; i > 0; i--) {
-		u32 idx = (rear + len - i % len) % len;
-		void __iomem *e = acpm->sram_base + data_ofs + idx * esz;
+	/*
+	 * Only channels Linux has used: the queue indices of the others can
+	 * sit in firewalled SRAM, and reading them raises an SError.
+	 */
+	acpm_dump_chan(failed);
+	for (i = 0; i < acpm->num_chans; i++) {
+		struct acpm_chan *c = &acpm->chans[i];
 
-		dev_err(dev, " fw %4u: %08x %08x %08x %08x\n", idx, readl(e),
-			readl(e + 4), readl(e + 8), readl(e + 12));
+		if (c != failed && c->seqnum)
+			acpm_dump_chan(c);
 	}
+}
+
+/*
+ * A firmware that has answered nothing for this long is not coming back: the
+ * IPC callers retry forever (TMU polling, DVFS) and the system wedges without
+ * the watchdog firing.  Panic instead so the log reaches pstore and panic=
+ * resets the SoC.  0 disables.
+ */
+static unsigned int panic_silent_ms = 3000;
+module_param(panic_silent_ms, uint, 0644);
+MODULE_PARM_DESC(panic_silent_ms, "panic when the firmware stays silent this long (0 = never)");
+
+static void acpm_check_silent(struct acpm_info *acpm, struct acpm_chan *achan,
+			      const char *why)
+{
+	s64 quiet_ms = div_s64(ktime_get_ns() - atomic64_read(&acpm->last_ok),
+			       NSEC_PER_MSEC);
+
+	if (!panic_silent_ms || quiet_ms < panic_silent_ms)
+		return;
+	/* second dump: did the firmware log or clock move since the first? */
+	atomic_set(&acpm->dumped, 0);
+	acpm_dump_state(acpm, achan, why);
+	panic("ACPM firmware silent for %lld ms (ch%u, %s)\n", quiet_ms,
+	      achan->id, why);
 }
 
 static int acpm_dequeue_by_polling(struct acpm_chan *achan,
@@ -455,6 +616,7 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 
 			/* Relinquish ownership of the sequence slot */
 			clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
+			atomic64_set(&achan->acpm->last_ok, ktime_get_ns());
 			return 0;
 		}
 
@@ -464,7 +626,8 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
 
 	dev_err(dev, "Timeout! ch:%u s:%u bitmap:%lx.\n",
 		achan->id, seqnum, achan->bitmap_seqnum[0]);
-	acpm_dump_state(achan->acpm, "IPC timeout");
+	acpm_dump_state(achan->acpm, achan, "IPC timeout");
+	acpm_check_silent(achan->acpm, achan, "IPC timeout");
 
 	return -ETIME;
 }
@@ -491,7 +654,8 @@ static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front)
 				 ACPM_TX_TIMEOUT_US);
 	if (ret) {
 		dev_err(achan->acpm->dev, "RX front can not keep up with TX front.\n");
-		acpm_dump_state(achan->acpm, "RX front stuck");
+		acpm_dump_state(achan->acpm, achan, "RX front stuck");
+		acpm_check_silent(achan->acpm, achan, "RX front stuck");
 		return ret;
 	}
 
@@ -882,6 +1046,7 @@ static int acpm_probe(struct platform_device *pdev)
 
 	size = resource_size(&res);
 	acpm->sram_size = size;
+	atomic64_set(&acpm->last_ok, ktime_get_ns());
 	acpm->sram_base = devm_ioremap(dev, res.start, size);
 	if (!acpm->sram_base)
 		return dev_err_probe(dev, -ENOMEM,
