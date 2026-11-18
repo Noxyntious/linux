@@ -49,6 +49,7 @@
 #include <linux/pci.h>
 #include <linux/pcie-zumapro.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
 #include <linux/timekeeping.h>
@@ -393,6 +394,16 @@ static bool wake_debug;
 module_param(wake_debug, bool, 0644);
 MODULE_PARM_DESC(wake_debug, "log CP traffic that follows a system resume");
 
+/*
+ * Hold the system awake this long after each CP interrupt, so the daemon
+ * reading the frame (ModemManager, exynos-modem, the RFS server) runs before
+ * the next suspend freezes it.  Downstream cpif keeps a per-io-device wake
+ * lock for the same purpose (WAKE_TIME, HZ/2).
+ */
+static unsigned int rx_wake_ms = 500;
+module_param(rx_wake_ms, uint, 0644);
+MODULE_PARM_DESC(rx_wake_ms, "stay awake this long after CP traffic (ms)");
+
 #define S5XXX_CH_RFS			0x29
 #define S5XXX_RFS_MAX			SZ_4K
 
@@ -623,6 +634,7 @@ struct s5xxx_modem {
 	int			cp_active_irq;	/* -1 when unavailable */
 	struct workqueue_struct	*pm_wq;
 	struct work_struct	pm_work;
+	struct delayed_work	park_retry;	/* re-run a park pm_work skipped */
 	struct mutex		pcie_onoff_lock; /* serialises relink up/down */
 	bool			pm_armed;	/* cp2ap_irq enabled (boot-seq guard) */
 	bool			link_up;	/* RC link powered on (sm->lock) */
@@ -705,6 +717,8 @@ struct s5xxx_modem {
 	bool			ul_active;
 	bool			tx_suspended;	/* CP TX flow control (cp2ap_status) */
 	int			wake_rx_log;	/* debug: frames to log after a wake */
+	struct wakeup_source	*ws_link;	/* CP has / wants the PCIe link */
+	struct wakeup_source	*ws_rx;		/* userspace owes a read */
 	int			nvec;		/* MSI vectors actually allocated */
 };
 
@@ -1079,6 +1093,7 @@ static void s5xxx_relink_restore(struct s5xxx_modem *sm)
 }
 
 #define S5XXX_PARK_SETTLE_MS	30
+#define S5XXX_PARK_RETRY_MS	200
 
 /*
  * The CP idle-parks its PCIe link aggressively (CP2AP_WAKEUP low ~1 s after it
@@ -1224,7 +1239,8 @@ static void s5xxx_pm_work(struct work_struct *work)
 			sm->main_armed = true;
 			spin_unlock_irqrestore(&sm->lock, flags);
 			sm->relink_failures = 0;
-			dev_dbg(sm->dev, "CP wakeup: link up (MAIN armed)\n");
+			if (wake_debug)
+				dev_info(sm->dev, "CP wakeup: link up (MAIN armed)\n");
 		} else {
 			/*
 			 * A CP can stay alive -- CP_ACTIVE and PS_HOLD high --
@@ -1292,14 +1308,45 @@ static void s5xxx_pm_work(struct work_struct *work)
 					      READ_ONCE(sm->fmt_busy_until)));
 			if (park)
 				sm->link_up = false;
+			else if (wake_debug)
+				dev_info(sm->dev,
+					 "CP sleep: park skipped (tx pending %d, db %d, fmt busy %d)\n",
+					 s5xxx_tx_pending(sm), sm->db_reserved,
+					 time_before(jiffies, READ_ONCE(sm->fmt_busy_until)));
 			spin_unlock_irqrestore(&sm->lock, flags);
 
 			if (park) {
 				zumapro_pcie_modem_link_down(sm->rc_dev);
-				dev_dbg(sm->dev, "CP sleep: link down (parked)\n");
+				if (wake_debug)
+					dev_info(sm->dev, "CP sleep: link down (parked)\n");
+			} else {
+				/*
+				 * The CP has released the link and will not
+				 * raise another edge until it wants it again,
+				 * so nothing else retries this park: the link
+				 * would sit at L0 with AP2CP_WAKEUP high and
+				 * every system suspend would be refused. Retry
+				 * once the owed frame has had time to drain.
+				 */
+				mod_delayed_work(sm->pm_wq, &sm->park_retry,
+						 msecs_to_jiffies(S5XXX_PARK_RETRY_MS));
 			}
 		}
 	}
+
+	/*
+	 * Keep the system awake for as long as the CP has, or is asking for,
+	 * the link: a suspend attempted now only gets as far as our noirq
+	 * refusal, after freezing every task and suspending every device.
+	 * Holding a wakeup source makes the wakeup_count handshake wait for
+	 * the park instead (downstream cpif holds mld->ws the same way). A
+	 * link the CP released but we could not park yet (tx still owed) is
+	 * held only briefly; the noirq refusal stays as the backstop.
+	 */
+	if (!sm->link_up && !gpiod_get_value_cansleep(sm->cp2ap_wakeup))
+		__pm_relax(sm->ws_link);
+	else if (sm->link_up && !gpiod_get_value_cansleep(sm->cp2ap_wakeup))
+		__pm_wakeup_event(sm->ws_link, 1000);
 
 	mutex_unlock(&sm->pcie_onoff_lock);
 
@@ -1325,6 +1372,14 @@ static void s5xxx_pm_work(struct work_struct *work)
 	}
 }
 
+static void s5xxx_park_retry(struct work_struct *work)
+{
+	struct s5xxx_modem *sm = container_of(to_delayed_work(work),
+					      struct s5xxx_modem, park_retry);
+
+	queue_work(sm->pm_wq, &sm->pm_work);
+}
+
 static irqreturn_t s5xxx_cp2ap_wakeup_irq(int irq, void *data)
 {
 	struct s5xxx_modem *sm = data;
@@ -1338,6 +1393,8 @@ static irqreturn_t s5xxx_cp2ap_wakeup_irq(int irq, void *data)
 
 	WRITE_ONCE(sm->cp_wants_up, up);
 	dev_dbg(sm->dev, "CP2AP_WAKEUP irq: level %d\n", up);
+	if (up)
+		__pm_stay_awake(sm->ws_link);	/* released by pm_work once parked */
 	queue_work(sm->pm_wq, &sm->pm_work);
 	return IRQ_HANDLED;
 }
@@ -3582,6 +3639,8 @@ static irqreturn_t s5xxx_irq_handler(int irq, void *data)
 	u32 val, cmd;
 
 	sm->irq_count++;
+	if (rx_wake_ms)
+		__pm_wakeup_event(sm->ws_rx, rx_wake_ms);
 	val = readl(sm->ipc + S5XXX_IPC_CP2AP_MSG);
 	/* Surface interrupt-value changes so post-bounce MSI liveness is visible. */
 	if (val != sm->last_cp2ap) {
@@ -4617,7 +4676,9 @@ static int s5xxx_dump_boot(struct s5xxx_modem *sm)
 		sm->pm_armed = false;
 	}
 	mutex_unlock(&sm->pcie_onoff_lock);
+	cancel_delayed_work_sync(&sm->park_retry);
 	cancel_work_sync(&sm->pm_work);
+	cancel_delayed_work_sync(&sm->park_retry);
 	sm->link_up = true;
 
 	dev_info(sm->dev, "dump boot: resetting the CP into minidump mode\n");
@@ -4963,6 +5024,15 @@ static int s5xxx_map_region(struct s5xxx_modem *sm, const char *name,
 	return 0;
 }
 
+/* devm action: runs after remove() / a failed probe has freed the IRQs */
+static void s5xxx_unregister_ws(void *data)
+{
+	struct s5xxx_modem *sm = data;
+
+	wakeup_source_unregister(sm->ws_rx);
+	wakeup_source_unregister(sm->ws_link);
+}
+
 static int s5xxx_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -4981,6 +5051,13 @@ static int s5xxx_probe(struct platform_device *pdev)
 	if (!sm->var)
 		return -EINVAL;
 	sm->dev = dev;
+
+	sm->ws_link = wakeup_source_register(dev, "s5xxx-link");
+	sm->ws_rx = wakeup_source_register(dev, "s5xxx-rx");
+	ret = devm_add_action_or_reset(dev, s5xxx_unregister_ws, sm);
+	if (ret)
+		return ret;
+
 	spin_lock_init(&sm->lock);
 	spin_lock_init(&sm->tx_lock);
 	mutex_init(&sm->pcie_onoff_lock);
@@ -4988,6 +5065,7 @@ static int s5xxx_probe(struct platform_device *pdev)
 	init_completion(&sm->gnss_rsp);
 	INIT_WORK(&sm->boot_work, s5xxx_boot_work);
 	INIT_WORK(&sm->pm_work, s5xxx_pm_work);
+	INIT_DELAYED_WORK(&sm->park_retry, s5xxx_park_retry);
 	INIT_WORK(&sm->rfs_work, s5xxx_rfs_work);
 	INIT_LIST_HEAD(&sm->rfs_rxq);
 	spin_lock_init(&sm->rfs_lock);
@@ -5373,7 +5451,9 @@ static void s5xxx_remove(struct platform_device *pdev)
 	free_irq(sm->cp2ap_irq, sm);
 	if (sm->cp_active_irq >= 0)
 		free_irq(sm->cp_active_irq, sm);
+	cancel_delayed_work_sync(&sm->park_retry);
 	cancel_work_sync(&sm->pm_work);
+	cancel_delayed_work_sync(&sm->park_retry);
 	destroy_workqueue(sm->pm_wq);
 
 	cancel_work_sync(&sm->boot_work);
@@ -5431,6 +5511,7 @@ static int s5xxx_suspend_noirq(struct device *dev)
 		 * finds the CP done with the link instead of refusing forever.
 		 */
 		WRITE_ONCE(sm->cp_wants_up, 1);
+		__pm_stay_awake(sm->ws_link);
 		queue_work(sm->pm_wq, &sm->pm_work);
 		return -EBUSY;
 	}
@@ -5468,6 +5549,11 @@ static int s5xxx_resume_noirq(struct device *dev)
 			 gpiod_get_value(sm->cp_active));
 	}
 	irq_set_irq_type(sm->cp2ap_irq, IRQ_TYPE_EDGE_BOTH);
+	/* a level that was already high when we woke raises no edge */
+	if (gpiod_get_value(sm->cp2ap_wakeup)) {
+		WRITE_ONCE(sm->cp_wants_up, 1);
+		__pm_stay_awake(sm->ws_link);
+	}
 	s5xxx_publish_kernel_time(sm);
 	ret = zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
 
@@ -5524,7 +5610,9 @@ static void s5xxx_shutdown(struct platform_device *pdev)
 	free_irq(sm->cp2ap_irq, sm);
 	if (sm->cp_active_irq >= 0)
 		free_irq(sm->cp_active_irq, sm);
+	cancel_delayed_work_sync(&sm->park_retry);
 	cancel_work_sync(&sm->pm_work);
+	cancel_delayed_work_sync(&sm->park_retry);
 	cancel_work_sync(&sm->boot_work);
 	if (sm->nvec > 1)
 		free_irq(pci_irq_vector(sm->pdev, 1), sm);
