@@ -1247,6 +1247,100 @@ static irqreturn_t max17042_thread_handler(int id, void *dev)
  */
 #define MAX17042_CONFIG_TEX	BIT(8)
 
+/*
+ * MAX77759 (Pixel "M5" gauge): load the battery model from the DT when the
+ * gauge does not hold it. On Pixels Google's BMS loads it; mainline never
+ * did, so after any gauge power-on reset the gauge ran on its defaults
+ * (DesignCap 0x0bb8, generic curve): wrong capacity and a drifting SOC.
+ *   maxim,fg-model	48 words for 0x80..0xaf (OCV / capacity / RComp table)
+ *   maxim,fg-params	register, value pairs, written in order
+ * Sequence after Google's max_m5 driver / the MAX1720x guide: wake from
+ * hibernate, unlock, write + verify the table, lock, write the parameters,
+ * Config2.LdMdl and wait for the gauge to clear it, restore HibCfg.
+ */
+#define MAX77759_FG_MODEL_WORDS		48
+#define MAX77759_FG_MAX_PARAMS		64
+#define MAX17055_CONFIG2_LDMDL		BIT(5)
+
+static int max77759_fg_load_model(struct max17042_chip *chip)
+{
+	struct device *dev = chip->dev;
+	struct device_node *np = dev->of_node;
+	struct regmap *map = chip->regmap;
+	u16 model[MAX77759_FG_MODEL_WORDS];
+	u16 params[MAX77759_FG_MAX_PARAMS];
+	unsigned int val, hib = 0, design = 0;
+	int n, i, ret;
+
+	if (!np || of_property_read_u16_array(np, "maxim,fg-model", model,
+					      MAX77759_FG_MODEL_WORDS))
+		return 0;
+	n = of_property_count_u16_elems(np, "maxim,fg-params");
+	if (n <= 0 || n % 2 || n > MAX77759_FG_MAX_PARAMS)
+		return dev_err_probe(dev, -EINVAL, "bad maxim,fg-params\n");
+	ret = of_property_read_u16_array(np, "maxim,fg-params", params, n);
+	if (ret)
+		return ret;
+	for (i = 0; i < n; i += 2)
+		if (params[i] == MAX17042_DesignCap)
+			design = params[i + 1];
+
+	ret = regmap_read(map, MAX17042_DesignCap, &val);
+	if (ret)
+		return ret;
+	if (design && val == design) {
+		dev_info(dev, "battery model already loaded (DesignCap %#x)\n", val);
+		return 0;
+	}
+	dev_info(dev, "loading the battery model (DesignCap %#x, model %#x)\n",
+		 val, design);
+
+	regmap_read(map, MAX17055_HibCfg, &hib);
+	regmap_write(map, MAX17055_SoftWakeup, 0x0090);
+	regmap_write(map, MAX17055_HibCfg, 0x0000);
+	regmap_write(map, MAX17055_SoftWakeup, 0x0000);
+
+	regmap_write(map, MAX17042_MLOCKReg1, MODEL_UNLOCK1);
+	regmap_write(map, MAX17042_MLOCKReg2, MODEL_UNLOCK2);
+	for (i = 0; i < MAX77759_FG_MODEL_WORDS && !ret; i++)
+		ret = regmap_write(map, MAX17042_MODELChrTbl + i, model[i]);
+	for (i = 0; i < MAX77759_FG_MODEL_WORDS && !ret; i++) {
+		ret = regmap_read(map, MAX17042_MODELChrTbl + i, &val);
+		if (!ret && val != model[i]) {
+			dev_err(dev, "model word %d reads %#x, wrote %#x\n",
+				i, val, model[i]);
+			ret = -EIO;
+		}
+	}
+	regmap_write(map, MAX17042_MLOCKReg1, MODEL_LOCK1);
+	regmap_write(map, MAX17042_MLOCKReg2, MODEL_LOCK2);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < n && !ret; i += 2)
+		ret = regmap_write(map, params[i], params[i + 1]);
+	if (ret)
+		goto out;
+
+	ret = regmap_update_bits(map, MAX17055_Config2, MAX17055_CONFIG2_LDMDL,
+				 MAX17055_CONFIG2_LDMDL);
+	if (!ret)
+		ret = regmap_read_poll_timeout(map, MAX17055_Config2, val,
+					       !(val & MAX17055_CONFIG2_LDMDL),
+					       20000, 3000000);
+	if (ret)
+		dev_err(dev, "the gauge did not take the model (Config2 %#x): %d\n",
+			val, ret);
+out:
+	regmap_write(map, MAX17055_HibCfg, hib);
+	if (!ret) {
+		regmap_update_bits(map, MAX17042_STATUS, STATUS_POR_BIT, 0);
+		regmap_read(map, MAX17042_DesignCap, &val);
+		dev_info(dev, "battery model loaded (DesignCap %#x)\n", val);
+	}
+	return ret;
+}
+
 static void max17042_setup_thermistor(struct max17042_chip *chip)
 {
 	struct device_node *np = chip->dev->of_node;
@@ -1606,6 +1700,11 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
 		regmap_write(chip->regmap, MAX17042_MiscCFG, 0x0003);
 		regmap_write(chip->regmap, MAX17042_LearnCFG, 0x0007);
 	}
+
+	/* before TaskPeriod is read: the model sets it */
+	if (chip->chip_type == MAXIM_DEVICE_TYPE_MAX77759 &&
+	    max77759_fg_load_model(chip))
+		dev_warn(dev, "running without the battery model\n");
 
 	chip->task_period = MAX17042_DEFAULT_TASK_PERIOD;
 	if (chip->chip_type == MAXIM_DEVICE_TYPE_MAX77759) {
