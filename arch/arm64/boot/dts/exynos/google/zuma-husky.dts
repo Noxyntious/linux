@@ -396,15 +396,17 @@
  * Main PMIC (S2MPG14), only the two touch rails for now. Every other rail is
  * left as the bootloader set it: describing a regulator lets Linux set its
  * voltage, so nothing is listed without husky's own constraints. Values from
- * downstream zuma-husky-touch.dtsi; the IRQ is IRQB_M (SPI 75), as on the
- * Pixel 9 boards (identical interrupt map).
+ * downstream zuma-husky-touch.dtsi.  The IRQ is INTCOMB_VGPIO2AP (SPI 74,
+ * downstream zuma-pmic.dtsi): the APM reads the PMIC's IRQB and forwards it
+ * through that combiner.  SPI 75 (IRQB_M, the Pixel 9 boards' number) never
+ * fires on zuma, so the RTC alarm never reached Linux.
  */
 &acpm_ipc {
 	pmic-1 {
 		compatible = "samsung,s2mpg14-pmic";
 		interrupt-parent = <&gic>;
-		interrupts = <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH 0>;
-		/* RTC alarm wakes the system (as on the Pixel 9 boards) */
+		interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH 0>;
+		/* RTC alarm wakes the system */
 		wakeup-source;
 
 		regulators {
