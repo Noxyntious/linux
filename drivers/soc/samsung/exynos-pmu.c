@@ -21,6 +21,8 @@
 #include <linux/regmap.h>
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
+#include <linux/tick.h>
+#include <linux/moduleparam.h>
 
 #include <linux/soc/samsung/exynos-regs-pmu.h>
 #include <linux/soc/samsung/exynos-pmu.h>
@@ -609,6 +611,59 @@ static u32 zumapro_dbg_c2, zumapro_dbg_sicd, zumapro_dbg_fail;
  * CPU_PM_ENTER on the boot core *after* the sleep hint below has been
  * published and before the firmware call -- overwriting SLEEP with SICD.
  */
+/*
+ * Cluster power-down (CPD) in awake idle.  The vendor exynos-cpupm, on the
+ * last core of a cluster going idle while every sibling's next event is at
+ * least the CPD target residency away, publishes CPU_INFORM_CPD instead of C2
+ * (cal_cluster_disable(); the zuma cluster sequences themselves are empty,
+ * the APM's flexpmu does the work).  Without it the clusters' shared logic
+ * (DSU slice, L3 share) never powers off while the phone is awake.
+ *
+ * Only the little (cpu0-3) and mid (cpu4-7) clusters: the X3 is a cluster of
+ * its own and its C2 is disabled (the flexpmu halted in its power-down).
+ * Runtime switch: /sys/module/exynos_pmu/parameters/cpd (off by default
+ * until it has run on the phone for a while; exynos_pmu.cpd=1 on the cmdline).
+ */
+#define ZUMAPRO_CPD_RESIDENCY_NS	(10 * NSEC_PER_MSEC)
+
+static bool zumapro_cpd;
+module_param_named(cpd, zumapro_cpd, bool, 0644);
+static unsigned int zumapro_cpd_entries;
+module_param_named(cpd_entries, zumapro_cpd_entries, uint, 0444);
+
+static struct cpumask zumapro_awake_idle;
+static DEFINE_PER_CPU(ktime_t, zumapro_next_event);
+
+static u32 zumapro_awake_hint(unsigned int cpu)
+{
+	unsigned int first, sib;
+	ktime_t now, next;
+
+	if (cpu >= 8)
+		return CPU_INFORM_C2;
+
+	next = tick_nohz_get_next_hrtimer();
+	per_cpu(zumapro_next_event, cpu) = next;
+	cpumask_set_cpu(cpu, &zumapro_awake_idle);
+
+	if (!READ_ONCE(zumapro_cpd))
+		return CPU_INFORM_C2;
+
+	first = cpu & ~3U;
+	for (sib = first; sib < first + 4; sib++) {
+		if (!cpumask_test_cpu(sib, &zumapro_awake_idle))
+			return CPU_INFORM_C2;
+		next = min(next, per_cpu(zumapro_next_event, sib));
+	}
+
+	now = ktime_get();
+	if (ktime_sub(next, now) < ZUMAPRO_CPD_RESIDENCY_NS)
+		return CPU_INFORM_C2;
+
+	zumapro_cpd_entries++;
+	return CPU_INFORM_CPD;
+}
+
 static int zumapro_cpu_pm_notify(struct notifier_block *self,
 				 unsigned long action, void *v)
 {
@@ -630,6 +685,7 @@ static int zumapro_cpu_pm_notify(struct notifier_block *self,
 	 */
 	if (action == CPU_PM_EXIT || action == CPU_PM_ENTER_FAILED) {
 		cpumask_clear_cpu(cpu, &zumapro_idle_cpus);
+		cpumask_clear_cpu(cpu, &zumapro_awake_idle);
 		if (zumapro_sicd_holder == cpu)
 			zumapro_sicd_holder = -1;
 		if (cpumask_test_cpu(cpu, &zumapro_hinted_cpus)) {
@@ -655,7 +711,7 @@ static int zumapro_cpu_pm_notify(struct notifier_block *self,
 	if (!pmu_context->sys_insuspend) {
 		if (action == CPU_PM_ENTER) {
 			if (regmap_write(pmu_context->pmureg, GS101_CPU_INFORM(cpu),
-					 CPU_INFORM_C2))
+					 zumapro_awake_hint(cpu)))
 				zumapro_dbg_fail++;
 			else
 				cpumask_set_cpu(cpu, &zumapro_hinted_cpus);
