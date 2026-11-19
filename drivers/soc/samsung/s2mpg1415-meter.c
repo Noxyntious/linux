@@ -131,7 +131,38 @@ struct s2mpg1415_meter {
 	const struct s2mpg1415_chip *chip;
 	/* Serialises the latch-then-read sequence against concurrent readers. */
 	struct mutex lock;
+	/* values latched right after the last restart */
+	u64 base_acc[S2MPG1415_METER_CHANNELS];
+	u32 base_count;
+	bool have_base;
 };
+
+/*
+ * Restart the accumulation window.  ASYNC_RD alone does not: the 20-bit
+ * sample count was found pinned at 0xfffff an hour after boot with every
+ * rail repeating the same figure read after read (the meter is battery
+ * powered and keeps counting across kernel boots).  Cycling METER_EN clears
+ * the accumulators.  Written raw, bypassing the cache: the PMIC can lose the
+ * enable over a system sleep while the cache still says it is on.
+ */
+static int s2mpg1415_meter_restart(struct s2mpg1415_meter *meter)
+{
+	unsigned int ctrl1;
+	int ret;
+
+	ret = regmap_read(meter->regmap, S2MPG14_METER_CTRL1, &ctrl1);
+	if (ret)
+		return ret;
+
+	regcache_cache_bypass(meter->regmap, true);
+	ret = regmap_write(meter->regmap, S2MPG14_METER_CTRL1, ctrl1 & ~METER_EN);
+	if (!ret)
+		ret = regmap_write(meter->regmap, S2MPG14_METER_CTRL1,
+				   ctrl1 | METER_EN);
+	regcache_cache_bypass(meter->regmap, false);
+
+	return ret;
+}
 
 static u64 s2mpg1415_read_le(const u8 *buf, unsigned int bytes)
 {
@@ -144,21 +175,14 @@ static u64 s2mpg1415_read_le(const u8 *buf, unsigned int bytes)
 	return val;
 }
 
-static int s2mpg1415_meter_show(struct seq_file *s, void *unused)
+/* Latch the accumulators into the readable registers (self-clearing). */
+static int s2mpg1415_meter_latch(struct s2mpg1415_meter *meter, u32 *count,
+				 u64 *acc)
 {
-	struct s2mpg1415_meter *meter = s->private;
-	u8 count_buf[ACC_COUNT_BYTES];
-	u32 acc_count, ctrl2;
+	u8 count_buf[ACC_COUNT_BYTES], acc_buf[ACC_DATA_BYTES];
+	u32 ctrl2;
 	int ch, ret;
 
-	guard(mutex)(&meter->lock);
-
-	/*
-	 * Latch the accumulators and wait for the self-clear. The data and the
-	 * sample count are not latched at the same instant, so reading during
-	 * acquisition pairs an accumulator with a count from a different window
-	 * and skews the average by whatever the mismatch happens to be.
-	 */
 	ret = regmap_update_bits(meter->regmap, S2MPG14_METER_CTRL2,
 				 ASYNC_RD, ASYNC_RD);
 	if (ret)
@@ -173,47 +197,97 @@ static int s2mpg1415_meter_show(struct seq_file *s, void *unused)
 			       count_buf, ACC_COUNT_BYTES);
 	if (ret)
 		return ret;
-
-	acc_count = s2mpg1415_read_le(count_buf, ACC_COUNT_BYTES) & ACC_COUNT_MASK;
-	if (!acc_count) {
-		seq_puts(s, "no samples accumulated\n");
-		return 0;
-	}
-
-	seq_printf(s, "%-16s %10s %10s\n", "rail", "uW", "uW_lpf");
+	*count = s2mpg1415_read_le(count_buf, ACC_COUNT_BYTES) & ACC_COUNT_MASK;
 
 	for (ch = 0; ch < S2MPG1415_METER_CHANNELS; ch++) {
-		const struct s2mpg1415_rail *rail = &meter->chip->rails[ch];
-		u8 acc_buf[ACC_DATA_BYTES], lpf_buf[LPF_DATA_BYTES];
-		u64 acc, lpf, mw_iq30, lpf_mw_iq30;
-
-		if (!rail->name)
-			continue;
-
 		ret = regmap_bulk_read(meter->regmap,
 				       S2MPG14_METER_ACC_DATA_CH0_1 +
 				       ch * ACC_DATA_BYTES,
 				       acc_buf, ACC_DATA_BYTES);
 		if (ret)
 			return ret;
-
-		ret = regmap_bulk_read(meter->regmap,
-				       S2MPG14_METER_LPF_DATA_CH0_1 +
-				       ch * LPF_DATA_BYTES,
-				       lpf_buf, LPF_DATA_BYTES);
-		if (ret)
-			return ret;
-
-		acc = s2mpg1415_read_le(acc_buf, ACC_DATA_BYTES) & ACC_DATA_MASK;
-		lpf = s2mpg1415_read_le(lpf_buf, LPF_DATA_BYTES) & LPF_DATA_MASK;
-		mw_iq30 = mul_u64_u64_div_u64(acc, rail->resolution, acc_count);
-		lpf_mw_iq30 = lpf * rail->resolution;
-
-		seq_printf(s, "%-16s %10llu %10llu\n", rail->name,
-			   (mw_iq30 * 1000) >> 30, (lpf_mw_iq30 * 1000) >> 30);
+		acc[ch] = s2mpg1415_read_le(acc_buf, ACC_DATA_BYTES) &
+			  ACC_DATA_MASK;
 	}
 
-	seq_printf(s, "\nsamples in window: %u\n", acc_count);
+	return 0;
+}
+
+/*
+ * Each read reports the average since the previous read.  The latched values
+ * are differenced against a baseline taken right after the previous read
+ * restarted the meter, so the figure is right whether or not the restart
+ * clears the accumulators.  (Without the restart the window never moved: an
+ * hour after boot the count sat at 0xfffff and every rail repeated the same
+ * figure read after read.)
+ */
+static int s2mpg1415_meter_show(struct seq_file *s, void *unused)
+{
+	struct s2mpg1415_meter *meter = s->private;
+	u64 acc[S2MPG1415_METER_CHANNELS];
+	u8 lpf_buf[LPF_DATA_BYTES];
+	u32 count, window;
+	int ch, ret;
+
+	guard(mutex)(&meter->lock);
+
+	ret = s2mpg1415_meter_latch(meter, &count, acc);
+	if (ret)
+		return ret;
+
+	if (meter->have_base && count > meter->base_count) {
+		window = count - meter->base_count;
+	} else if (meter->have_base) {
+		window = 0;
+	} else {
+		/* first read: whatever the meter holds */
+		window = count;
+		memset(meter->base_acc, 0, sizeof(meter->base_acc));
+	}
+
+	if (!window) {
+		seq_printf(s, "no new samples (count %#x)\n", count);
+	} else {
+		seq_printf(s, "%-16s %10s %10s\n", "rail", "uW", "uW_lpf");
+
+		for (ch = 0; ch < S2MPG1415_METER_CHANNELS; ch++) {
+			const struct s2mpg1415_rail *rail =
+				&meter->chip->rails[ch];
+			u64 lpf, mw_iq30, lpf_mw_iq30, d;
+
+			if (!rail->name)
+				continue;
+
+			ret = regmap_bulk_read(meter->regmap,
+					       S2MPG14_METER_LPF_DATA_CH0_1 +
+					       ch * LPF_DATA_BYTES,
+					       lpf_buf, LPF_DATA_BYTES);
+			if (ret)
+				return ret;
+
+			d = acc[ch] >= meter->base_acc[ch] ?
+			    acc[ch] - meter->base_acc[ch] : 0;
+			lpf = s2mpg1415_read_le(lpf_buf, LPF_DATA_BYTES) &
+			      LPF_DATA_MASK;
+			mw_iq30 = mul_u64_u64_div_u64(d, rail->resolution, window);
+			lpf_mw_iq30 = lpf * rail->resolution;
+
+			seq_printf(s, "%-16s %10llu %10llu\n", rail->name,
+				   (mw_iq30 * 1000) >> 30,
+				   (lpf_mw_iq30 * 1000) >> 30);
+		}
+
+		seq_printf(s, "\nsamples in window: %u\n", window);
+	}
+
+	/* restart, then take the next window's baseline */
+	ret = s2mpg1415_meter_restart(meter);
+	if (ret)
+		return ret;
+	ret = s2mpg1415_meter_latch(meter, &meter->base_count, meter->base_acc);
+	if (ret)
+		return ret;
+	meter->have_base = true;
 
 	return 0;
 }
