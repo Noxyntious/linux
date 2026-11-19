@@ -17,6 +17,7 @@
  * cs40l26 driver (android kernel/google-modules/amplifiers).
  */
 
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
@@ -25,6 +26,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 #include <linux/workqueue.h>
 
 #define CS40L26_DEVID			0x0
@@ -57,6 +59,25 @@
 #define CS40L26_GLOBAL_ENABLES		0x2014
 #define CS40L26_GLOBAL_EN		BIT(0)
 #define CS40L26_ERROR_RELEASE		0x2034
+/* ERROR_RELEASE bits (downstream enum cs40l26_err_rls) */
+#define CS40L26_AMP_SHORT_ERR_RLS	1
+#define CS40L26_BST_SHORT_ERR_RLS	2
+#define CS40L26_BST_OVP_ERR_RLS		3
+#define CS40L26_BST_UVP_ERR_RLS		4
+#define CS40L26_TEMP_ERR_RLS		6
+/* IRQ1 latched-event registers: write 1 to clear */
+#define CS40L26_IRQ1_EINT_1		0x10010
+#define CS40L26_IRQ1_EINT_2		0x10014
+#define CS40L26_IRQ1_STS_1		0x10090
+#define CS40L26_BST_OVP_ERR		BIT(20)
+#define CS40L26_BST_DCM_UVP_ERR		BIT(21)
+#define CS40L26_BST_SHORT_ERR_INT	BIT(22)
+#define CS40L26_BST_IPK_FLAG		BIT(23)
+#define CS40L26_TEMP_ERR		BIT(26)
+#define CS40L26_AMP_ERR			BIT(27)
+#define CS40L26_ERR_INTS		(CS40L26_BST_OVP_ERR | CS40L26_BST_DCM_UVP_ERR | \
+					 CS40L26_BST_SHORT_ERR_INT | CS40L26_TEMP_ERR | \
+					 CS40L26_AMP_ERR)
 #define CS40L26_BST_SHORT_ERR		BIT(2)
 #define CS40L26_PLL_REFCLK_DETECT_0	0x2c28
 #define CS40L26_VBST_CTL_1		0x3800
@@ -101,6 +122,9 @@ struct cs40l26 {
 	struct mutex lock;	/* serialises mailbox traffic */
 	u32 revid;
 	u32 halo_state_reg;
+	u32 bst_ipk;		/* BST_IPK_CTL as programmed: a reset chip reads other */
+	unsigned int err_releases;
+	struct dentry *dbgfs;
 
 	struct cs40l26_effect effects[CS40L26_MAX_EFFECTS];
 
@@ -175,6 +199,56 @@ static int cs40l26_mailbox(struct cs40l26 *cs, u32 cmd)
 	return -ETIMEDOUT;
 }
 
+/* Downstream cs40l26_error_release(): clear, set, clear the release bit. */
+static int cs40l26_error_release(struct cs40l26 *cs, unsigned int rls)
+{
+	u32 sts;
+	int ret;
+
+	ret = cs40l26_read(cs, CS40L26_ERROR_RELEASE, &sts);
+	if (!ret)
+		ret = cs40l26_write(cs, CS40L26_ERROR_RELEASE, sts & ~BIT(rls));
+	if (!ret)
+		ret = cs40l26_write(cs, CS40L26_ERROR_RELEASE, sts | BIT(rls));
+	if (!ret)
+		ret = cs40l26_write(cs, CS40L26_ERROR_RELEASE, sts & ~BIT(rls));
+	return ret;
+}
+
+/*
+ * The amplifier latches a protection fault (boost over/undervoltage, boost
+ * or amp short, die overtemperature) and stays silent until the host runs
+ * the release sequence; downstream does it from the chip's IRQ, which this
+ * driver does not wire up. Without it the haptics stopped mid-typing and
+ * came back only with the next fault-free reset (field report 2026-11-19).
+ * Poll the latched events after each playback instead. Caller holds lock.
+ */
+static void cs40l26_check_errors(struct cs40l26 *cs)
+{
+	static const struct { u32 bit; unsigned int rls; const char *what; } errs[] = {
+		{ CS40L26_BST_OVP_ERR, CS40L26_BST_OVP_ERR_RLS, "boost overvoltage" },
+		{ CS40L26_BST_DCM_UVP_ERR, CS40L26_BST_UVP_ERR_RLS, "boost undervoltage" },
+		{ CS40L26_BST_SHORT_ERR_INT, CS40L26_BST_SHORT_ERR_RLS, "boost short" },
+		{ CS40L26_TEMP_ERR, CS40L26_TEMP_ERR_RLS, "die overtemperature" },
+		{ CS40L26_AMP_ERR, CS40L26_AMP_SHORT_ERR_RLS, "amp short" },
+	};
+	u32 eint;
+	int i;
+
+	if (cs40l26_read(cs, CS40L26_IRQ1_EINT_1, &eint) || !(eint & CS40L26_ERR_INTS))
+		return;
+
+	cs40l26_write(cs, CS40L26_IRQ1_EINT_1, eint & CS40L26_ERR_INTS);
+	for (i = 0; i < ARRAY_SIZE(errs); i++) {
+		if (!(eint & errs[i].bit))
+			continue;
+		cs->err_releases++;
+		dev_warn_ratelimited(cs->dev, "%s, releasing (EINT_1 %#x, #%u)\n",
+				     errs[i].what, eint, cs->err_releases);
+		cs40l26_error_release(cs, errs[i].rls);
+	}
+}
+
 static void cs40l26_repeat_work(struct work_struct *work)
 {
 	struct cs40l26 *cs = container_of(to_delayed_work(work), struct cs40l26,
@@ -187,6 +261,7 @@ static void cs40l26_repeat_work(struct work_struct *work)
 				      msecs_to_jiffies(CS40L26_RUMBLE_PERIOD_MS));
 	} else {
 		cs40l26_mailbox(cs, CS40L26_STOP_PLAYBACK);
+		cs40l26_check_errors(cs);
 	}
 	mutex_unlock(&cs->lock);
 }
@@ -213,8 +288,12 @@ static void cs40l26_play_work(struct work_struct *work)
 	}
 
 	e = &cs->effects[id];
-	if (cs40l26_mailbox(cs, e->trigger))
+	if (cs40l26_mailbox(cs, e->trigger)) {
+		cs40l26_check_errors(cs);
 		goto out;
+	}
+	if (!e->repeat)
+		cs40l26_check_errors(cs);
 
 	if (e->repeat) {
 		cs->repeat_trigger = e->trigger;
@@ -483,6 +562,7 @@ static int cs40l26_boost_config(struct cs40l26 *cs)
 		ua = 4500000;
 	ipk = ua / CS40L26_BST_IPK_UA_STEP - 16;
 
+	cs->bst_ipk = ipk;
 	ret = cs40l26_write(cs, CS40L26_VBST_CTL_1, ctl);
 	if (!ret)
 		ret = cs40l26_update_bits(cs, CS40L26_VBST_CTL_2,
@@ -540,6 +620,81 @@ static int cs40l26_safety_init(struct cs40l26 *cs)
 
 	return cs40l26_boost_config(cs);
 }
+
+static int cs40l26_status_show(struct seq_file *m, void *unused)
+{
+	static const struct { const char *name; u32 reg; } regs[] = {
+		{ "IRQ1_EINT_1", CS40L26_IRQ1_EINT_1 },
+		{ "IRQ1_EINT_2", CS40L26_IRQ1_EINT_2 },
+		{ "IRQ1_STS_1", CS40L26_IRQ1_STS_1 },
+		{ "ERROR_RELEASE", CS40L26_ERROR_RELEASE },
+		{ "PM_CUR_STATE", CS40L26_A1_PM_CUR_STATE },
+		{ "PM_STATE_LOCK3", CS40L26_A1_PM_STATE_LOCKS + CS40L26_DSP_LOCK3_OFFSET },
+		{ "VBST_CTL_1", CS40L26_VBST_CTL_1 },
+		{ "BST_IPK_CTL", CS40L26_BST_IPK_CTL },
+		{ "MBOX_1", CS40L26_DSP_VIRTUAL1_MBOX_1 },
+	};
+	struct cs40l26 *cs = m->private;
+	u32 val;
+	int i;
+
+	mutex_lock(&cs->lock);
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		if (cs40l26_read(cs, regs[i].reg, &val))
+			seq_printf(m, "%-15s read error\n", regs[i].name);
+		else
+			seq_printf(m, "%-15s %#010x\n", regs[i].name, val);
+	}
+	seq_printf(m, "%-15s %#x (expected)\n", "bst_ipk", cs->bst_ipk);
+	seq_printf(m, "%-15s %u\n", "err_releases", cs->err_releases);
+	mutex_unlock(&cs->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(cs40l26_status);
+
+static void cs40l26_debugfs_remove(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
+static int cs40l26_suspend(struct device *dev)
+{
+	struct cs40l26 *cs = dev_get_drvdata(dev);
+
+	cancel_work_sync(&cs->play_work);
+	cancel_delayed_work_sync(&cs->repeat_work);
+	mutex_lock(&cs->lock);
+	cs40l26_mailbox(cs, CS40L26_STOP_PLAYBACK);
+	mutex_unlock(&cs->lock);
+	return 0;
+}
+
+/*
+ * If the chip lost power in system sleep, its ROM firmware rebooted with the
+ * default boost limits and hibernation allowed: redo the safety setup.
+ */
+static int cs40l26_resume(struct device *dev)
+{
+	struct cs40l26 *cs = dev_get_drvdata(dev);
+	u32 ipk = 0;
+	int ret = 0;
+
+	mutex_lock(&cs->lock);
+	if (cs40l26_read(cs, CS40L26_BST_IPK_CTL, &ipk) || ipk != cs->bst_ipk) {
+		dev_info(cs->dev, "lost its setup in sleep (BST_IPK %#x), redoing it\n",
+			 ipk);
+		ret = cs40l26_identify(cs);
+		if (!ret)
+			ret = cs40l26_safety_init(cs);
+		if (ret)
+			dev_err(cs->dev, "re-init after resume failed: %d\n", ret);
+	}
+	cs40l26_check_errors(cs);
+	mutex_unlock(&cs->lock);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(cs40l26_pm, cs40l26_suspend, cs40l26_resume);
 
 static int cs40l26_probe(struct i2c_client *client)
 {
@@ -606,6 +761,17 @@ static int cs40l26_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	i2c_set_clientdata(client, cs);
+	cs->dbgfs = debugfs_create_dir(dev_name(dev), NULL);
+	debugfs_create_file("status", 0400, cs->dbgfs, cs, &cs40l26_status_fops);
+	ret = devm_add_action_or_reset(dev, cs40l26_debugfs_remove, cs->dbgfs);
+	if (ret)
+		return ret;
+
+	mutex_lock(&cs->lock);
+	cs40l26_check_errors(cs);	/* anything latched before we were here */
+	mutex_unlock(&cs->lock);
+
 	return input_register_device(cs->input);
 }
 
@@ -628,6 +794,7 @@ static struct i2c_driver cs40l26_driver = {
 	.driver = {
 		.name = "cs40l26",
 		.of_match_table = cs40l26_of_match,
+		.pm = pm_sleep_ptr(&cs40l26_pm),
 	},
 	.probe = cs40l26_probe,
 	.id_table = cs40l26_id,
