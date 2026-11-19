@@ -1479,6 +1479,16 @@ void brcmf_dev_coredump(struct device *dev)
 		brcmf_dbg(TRACE, "failed to create coredump\n");
 }
 
+/*
+ * The coredump reads the dongle's whole RAM window over PCIe.  On a BCM4398
+ * that has trapped that read hangs the bus and the phone watchdog-resets
+ * (2026-11-19, kernel #89), so a crash goes straight to the bus reset unless
+ * the dump is asked for.
+ */
+static bool brcmf_fw_coredump;
+module_param_named(fw_coredump, brcmf_fw_coredump, bool, 0644);
+MODULE_PARM_DESC(fw_coredump, "Dump the dongle RAM before resetting a crashed firmware (can hang the bus)");
+
 void brcmf_fw_crashed(struct device *dev)
 {
 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
@@ -1496,7 +1506,8 @@ void brcmf_fw_crashed(struct device *dev)
 
 	bphy_err(drvr, "Firmware has halted or crashed\n");
 
-	brcmf_dev_coredump(dev);
+	if (brcmf_fw_coredump)
+		brcmf_dev_coredump(dev);
 
 	brcmf_bus_schedule_reset(bus_if);
 }
