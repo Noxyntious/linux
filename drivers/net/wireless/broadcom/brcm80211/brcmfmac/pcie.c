@@ -467,6 +467,9 @@ struct brcmf_pciedev_info {
 	/* firmware TRAP seen on the console: recover via brcmf_fw_crashed() */
 	bool trap_seen;
 	struct work_struct trap_work;
+	/* wlan_power: dongle torn down (no netdev) for system sleep */
+	bool wlan_off;
+	struct mutex wlan_power_lock;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
 	char sig_name[BRCMF_FW_NAME_LEN];
@@ -2103,6 +2106,13 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	/* BCM4398: a running firmware must be halted or the reset below leaves
+	 * the dongle unable to boot the next one (harmless if it already trapped) */
+	if (devinfo->ci && devinfo->ci->chip == BRCM_CC_4398_CHIP_ID &&
+	    devinfo->state == BRCMFMAC_PCIE_STATE_UP) {
+		brcmf_pcie_send_mb_data(devinfo, 0x20000000 /* H2D_FW_TRAP */);
+		msleep(50);
+	}
 	brcmf_pcie_intr_disable(devinfo);
 	/* intr_disable stops new interrupts but not an in-flight threaded-IRQ RX
 	 * handler; wait for it so brcmf_detach -> brcmf_net_detach can tear down
@@ -4027,6 +4037,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	timer_setup(&devinfo->timer, brcmf_pcie_fwcon, 0);
 #endif
 	INIT_WORK(&devinfo->trap_work, brcmf_pcie_trap_worker);
+	mutex_init(&devinfo->wlan_power_lock);
 
 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
 	if (!fwreq) {
@@ -4209,9 +4220,169 @@ cleanup:
 }
 
 
+/*
+ * BCM4398 (Pixel 8 Pro): the D3 handshake above cannot be used. The root
+ * port drops PERST# and WL_REG_ON in system sleep, so the dongle comes back
+ * cold; leave_D3() then falls back to remove + probe, and a probe on a
+ * device that was already enumerated never gets the firmware running ("FW
+ * failed to initialize"), while the hot-resume and D3 paths hung the phone.
+ * The bus-reset path (detach, chip reset, firmware reload on the same PCI
+ * device) does work, so sleep is built on it instead:
+ *
+ *   wlan_power 0	tear the dongle down: netdev gone, rings and IRQ freed,
+ *			nothing touches the chip, safe to lose power;
+ *   wlan_power 1	chip reset + firmware download, as after a bus reset.
+ *
+ * Userspace (ztos-autosleep) writes 0 before suspending and 1 when the
+ * screen comes back; the kernel does not bring it up on resume by itself
+ * because the modem wakes the phone every few seconds. Suspend with the
+ * dongle still up is refused rather than risking the old hang.
+ */
+/*
+ * A watchdog reset of a dongle whose firmware is still running leaves it
+ * unable to start the next firmware ("FW failed to initialize"); after a
+ * firmware trap the same reset works. So halt the firmware first.
+ *   0 no halt  1 ARM + d11 cores to passive after detach (does NOT work on
+ *   the BCM4398)  2 H2D_FW_TRAP first (works, also across a cold sleep)
+ */
+static int brcmf_halt_mode = 2;
+module_param_named(halt_mode, brcmf_halt_mode, int, 0644);
+MODULE_PARM_DESC(halt_mode, "How wlan_power 0 halts the firmware before the chip reset (0 none, 1 passive, 2 trap)");
+
+#define BRCMF_H2D_FW_TRAP_WORD		0x20000000
+
+static bool brcmf_pcie_cold_pm(struct brcmf_pciedev_info *devinfo)
+{
+	return devinfo->ci && devinfo->ci->chip == BRCM_CC_4398_CHIP_ID;
+}
+
+static int brcmf_pcie_wlan_power_off(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+
+	if (devinfo->wlan_off)
+		return 0;
+	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP)
+		return -EBUSY;		/* firmware still loading */
+
+	devinfo->trap_seen = true;	/* no trap recovery while down */
+	cancel_work_sync(&devinfo->trap_work);
+	brcmf_bus_cancel_reset_work(dev_get_drvdata(dev));
+	if (devinfo->poll_active) {
+		devinfo->poll_active = false;
+		cancel_delayed_work_sync(&devinfo->poll_work);
+	}
+	brcmf_pcie_fwcon_timer(devinfo, false);
+	if (brcmf_halt_mode == 2) {
+		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_FW_TRAP_WORD);
+		msleep(50);
+	}
+	brcmf_pcie_intr_disable(devinfo);
+	synchronize_irq(devinfo->pdev->irq);
+
+	brcmf_detach(dev);
+	brcmf_pcie_release_irq(devinfo);
+	brcmf_pcie_release_scratchbuffers(devinfo);
+	brcmf_pcie_release_ringbuffers(devinfo);
+	if (brcmf_halt_mode == 1)
+		brcmf_chip_set_passive(devinfo->ci);
+	/* in reset (no DMA into the freed rings) until wlan_power 1 */
+	brcmf_pcie_reset_device(devinfo);
+	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	devinfo->wlan_off = true;
+	dev_info(dev, "wlan_power: dongle down (halt mode %d)\n", brcmf_halt_mode);
+	return 0;
+}
+
+static int brcmf_pcie_wlan_power_on(struct brcmf_pciedev_info *devinfo)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_fw_request *fwreq;
+	int err;
+
+	if (!devinfo->wlan_off)
+		return 0;
+
+	brcmf_pcie_reset_device(devinfo);
+	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
+	if (!fwreq)
+		return -ENOMEM;
+	devinfo->wlan_off = false;
+	err = brcmf_fw_get_firmwares(dev, fwreq, brcmf_pcie_setup);
+	if (err) {
+		kfree(fwreq);
+		devinfo->wlan_off = true;
+		return err;
+	}
+	dev_info(dev, "wlan_power: dongle coming up\n");
+	return 0;
+}
+
+static ssize_t wlan_power_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+
+	return sysfs_emit(buf, "%d\n", devinfo->wlan_off ? 0 :
+			  devinfo->state == BRCMFMAC_PCIE_STATE_UP ? 1 : 2);
+}
+
+static ssize_t wlan_power_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	bool on;
+	int err;
+
+	err = kstrtobool(buf, &on);
+	if (err)
+		return err;
+	if (!brcmf_pcie_cold_pm(devinfo))
+		return -EOPNOTSUPP;
+
+	mutex_lock(&devinfo->wlan_power_lock);
+	err = on ? brcmf_pcie_wlan_power_on(devinfo) :
+		   brcmf_pcie_wlan_power_off(devinfo);
+	mutex_unlock(&devinfo->wlan_power_lock);
+	return err ? err : count;
+}
+static DEVICE_ATTR_RW(wlan_power);
+
+static struct attribute *brcmf_pcie_attrs[] = {
+	&dev_attr_wlan_power.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(brcmf_pcie);
+
+static int brcmf_pcie_pm_suspend(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+
+	if (!brcmf_pcie_cold_pm(devinfo))
+		return brcmf_pcie_pm_enter_D3(dev);
+	if (!devinfo->wlan_off) {
+		dev_warn(dev, "suspend refused: write 0 to wlan_power first\n");
+		return -EBUSY;
+	}
+	return 0;
+}
+
+static int brcmf_pcie_pm_resume(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+
+	if (!brcmf_pcie_cold_pm(devinfo))
+		return brcmf_pcie_pm_leave_D3(dev);
+	return 0;	/* stays down until wlan_power 1 */
+}
+
 static const struct dev_pm_ops brcmf_pciedrvr_pm = {
-	.suspend = brcmf_pcie_pm_enter_D3,
-	.resume = brcmf_pcie_pm_leave_D3,
+	.suspend = brcmf_pcie_pm_suspend,
+	.resume = brcmf_pcie_pm_resume,
 	.freeze = brcmf_pcie_pm_enter_D3,
 	.restore = brcmf_pcie_pm_leave_D3,
 };
@@ -4284,6 +4455,7 @@ static struct pci_driver brcmf_pciedrvr = {
 	.remove = brcmf_pcie_remove,
 #ifdef CONFIG_PM
 	.driver.pm = &brcmf_pciedrvr_pm,
+	.dev_groups = brcmf_pcie_groups,
 #endif
 	.driver.coredump = brcmf_dev_coredump,
 };
