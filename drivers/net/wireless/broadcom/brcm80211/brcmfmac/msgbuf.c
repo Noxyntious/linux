@@ -284,6 +284,7 @@ struct brcmf_msgbuf_work_item {
 
 struct brcmf_msgbuf {
 	struct brcmf_pub *drvr;
+	u8 dcmd_timeouts;	/* consecutive unanswered control commands */
 
 	struct brcmf_commonring **commonrings;
 	struct brcmf_commonring **flowrings;
@@ -578,8 +579,18 @@ static int brcmf_msgbuf_query_dcmd(struct brcmf_pub *drvr, int ifidx,
 	timeout = brcmf_msgbuf_ioctl_resp_wait(msgbuf);
 	if (!timeout) {
 		bphy_err(drvr, "Timeout on response for query command\n");
+		/*
+		 * A dongle that trapped without raising FWHALT (and without
+		 * a console line we could catch) answers nothing again.  Two
+		 * timeouts in a row: treat it as crashed and reset it.
+		 */
+		if (++msgbuf->dcmd_timeouts == 2) {
+			bphy_err(drvr, "firmware stopped answering, resetting the dongle\n");
+			brcmf_fw_crashed(drvr->bus_if->dev);
+		}
 		return -EIO;
 	}
+	msgbuf->dcmd_timeouts = 0;
 
 	skb = brcmf_msgbuf_get_pktid(msgbuf->drvr->bus_if->dev,
 				     msgbuf->rx_pktids,

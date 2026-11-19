@@ -464,6 +464,9 @@ struct brcmf_otp_params {
 struct brcmf_pciedev_info {
 	enum brcmf_pcie_state state;
 	bool in_irq;
+	/* firmware TRAP seen on the console: recover via brcmf_fw_crashed() */
+	bool trap_seen;
+	struct work_struct trap_work;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
 	char sig_name[BRCMF_FW_NAME_LEN];
@@ -1199,6 +1202,22 @@ static void brcmf_pcie_bus_console_read(struct brcmf_pciedev_info *devinfo,
 					    console->log_str);
 			else
 				pr_info("CONSOLE: %s", console->log_str);
+			/*
+			 * "TRAP 4(3faa68): pc 3bd468, lr ..." -- the dongle
+			 * hit an assert or fault and will not answer again.
+			 * The BCM4398 does not raise D2H_DEV_FWHALT for it,
+			 * so nothing else notices: the netdev stays "up" and
+			 * every frame and command is dropped until a reboot.
+			 * Recover the same way FWHALT does.  Only from the
+			 * periodic read (not the error dump the reset path
+			 * itself does) and once per firmware boot.
+			 */
+			if (!error && !devinfo->trap_seen &&
+			    strstr(console->log_str, "TRAP ") &&
+			    strstr(console->log_str, " pc ")) {
+				devinfo->trap_seen = true;
+				schedule_work(&devinfo->trap_work);
+			}
 			console->log_idx = 0;
 		}
 	}
@@ -3444,6 +3463,16 @@ static void brcmf_pcie_enable_l1ss(struct brcmf_pciedev_info *devinfo)
 	bphy_err(bus->drvr, "L1SS: full L1SS + ASPM-L1 enabled\n");
 }
 
+static void brcmf_pcie_trap_worker(struct work_struct *work)
+{
+	struct brcmf_pciedev_info *devinfo =
+		container_of(work, struct brcmf_pciedev_info, trap_work);
+
+	dev_err(&devinfo->pdev->dev,
+		"firmware trap on the console, resetting the dongle\n");
+	brcmf_fw_crashed(&devinfo->pdev->dev);
+}
+
 static void brcmf_pcie_setup(struct device *dev, int ret,
 			     struct brcmf_fw_request *fwreq)
 {
@@ -3551,6 +3580,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 
 	brcmf_pcie_bus_console_read(devinfo, false);
 
+	/* a fresh firmware: arm the console trap detector again */
+	devinfo->trap_seen = false;
 	brcmf_pcie_fwcon_timer(devinfo, true);
 
 	return;
@@ -3761,6 +3792,31 @@ static const struct file_operations brcmf_pcie_romdump_fops = {
 	.llseek		= default_llseek,
 };
 
+/*
+ * Test hook: ask the dongle to trap (bcmdhd dhdpcie_fw_trap(): mailbox word
+ * H2D_FW_TRAP), to exercise the trap -> reset recovery without waiting for a
+ * real firmware fault.
+ */
+#define BRCMF_H2D_FW_TRAP		0x20000000
+static ssize_t brcmf_pcie_fwtrap_write(struct file *f, const char __user *buf,
+				       size_t count, loff_t *ppos)
+{
+	struct brcmf_pciedev_info *devinfo = f->private_data;
+	int err;
+
+	err = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_FW_TRAP);
+	dev_info(&devinfo->pdev->dev, "debugfs: asked the dongle to trap (%d)\n",
+		 err);
+	return err ? err : count;
+}
+
+static const struct file_operations brcmf_pcie_fwtrap_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.write	= brcmf_pcie_fwtrap_write,
+	.llseek	= default_llseek,
+};
+
 static void brcmf_pcie_debugfs_create(struct device *dev)
 {
 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
@@ -3779,6 +3835,8 @@ static void brcmf_pcie_debugfs_create(struct device *dev)
 
 	debugfs_create_file("romdump", 0400, dentry, devinfo,
 			    &brcmf_pcie_romdump_fops);
+	debugfs_create_file("fwtrap", 0200, dentry, devinfo,
+			    &brcmf_pcie_fwtrap_fops);
 }
 
 #else
@@ -3968,6 +4026,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	/* Set up the fwcon timer */
 	timer_setup(&devinfo->timer, brcmf_pcie_fwcon, 0);
 #endif
+	INIT_WORK(&devinfo->trap_work, brcmf_pcie_trap_worker);
 
 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
 	if (!fwreq) {
@@ -4021,6 +4080,8 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 	brcmf_pcie_bus_console_read(devinfo, false);
 	brcmf_pcie_fwcon_timer(devinfo, false);
+	devinfo->trap_seen = true;	/* no new trap work from here on */
+	cancel_work_sync(&devinfo->trap_work);
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	if (devinfo->poll_active) {
