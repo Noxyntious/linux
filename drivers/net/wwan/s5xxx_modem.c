@@ -55,6 +55,7 @@
 #include <linux/timekeeping.h>
 #include <linux/slab.h>
 #include <linux/sprintf.h>
+#include <linux/timer.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -404,6 +405,32 @@ static unsigned int rx_wake_ms = 500;
 module_param(rx_wake_ms, uint, 0644);
 MODULE_PARM_DESC(rx_wake_ms, "stay awake this long after CP traffic (ms)");
 
+/*
+ * DL safety poll.  DL is only drained from MSI-0, and an MSI the CP raises
+ * while the CP is parking or relinking the link is lost: the relink re-runs
+ * dw_pcie_setup_rc() and reprograms the MSI target.  The packets it announced
+ * stay in the ring until the next MSI, which on an idle-then-bursty TCP flow
+ * is the server's retransmit after RTO backoff (1, 2, 4 ... s).  Downloads
+ * then crawl in bursts and finally time out (field report 2026-11-19).  So
+ * drain after every relink, and re-check the ring dl_poll_ms after DL
+ * activity.  dl_stranded counts packets that only the poll found.
+ */
+static unsigned int dl_poll_ms = 20;
+module_param(dl_poll_ms, uint, 0644);
+MODULE_PARM_DESC(dl_poll_ms, "re-check the DL ring this long after DL traffic or a relink (0 = off)");
+static unsigned int dl_stranded;
+module_param(dl_stranded, uint, 0444);
+MODULE_PARM_DESC(dl_stranded, "DL packets found by the safety poll, not by an MSI");
+static unsigned int dl_relink_found;
+module_param(dl_relink_found, uint, 0444);
+MODULE_PARM_DESC(dl_relink_found, "DL packets found pending right after a relink");
+static unsigned int ul_rekicks;
+module_param(ul_rekicks, uint, 0444);
+MODULE_PARM_DESC(ul_rekicks, "UL doorbells re-rung because the CP left the ring unconsumed");
+#define S5XXX_UL_REKICK_POLLS		2	/* rear unchanged this many polls */
+#define S5XXX_DL_POLL_ROUNDS_TRAFFIC	3
+#define S5XXX_DL_POLL_ROUNDS_RELINK	10
+
 #define S5XXX_CH_RFS			0x29
 #define S5XXX_RFS_MAX			SZ_4K
 
@@ -711,6 +738,11 @@ struct s5xxx_modem {
 	bool			pdp_up;		/* netdevs registered (release/acquire) */
 	u32			dl_fore[S5XXX_PKTPROC_DL_NUM_QUEUE];
 	u32			dl_done[S5XXX_PKTPROC_DL_NUM_QUEUE];
+	spinlock_t		dl_lock;	/* dl_fore/dl_done: MSI, poll, relink */
+	struct timer_list	dl_poll;	/* DL safety poll (lost MSIs) */
+	unsigned int		dl_poll_left;	/* rounds before the poll stops */
+	u32			ul_watch_rear;	/* UL rear at the last poll */
+	unsigned int		ul_watch_polls;	/* polls the UL rear sat still */
 	u32			ul_done;
 	u16			ul_cp_quota;
 	u8			ul_end_bit_owner;
@@ -1124,6 +1156,28 @@ static inline void s5xxx_fmt_mark_busy(struct s5xxx_modem *sm)
  * check_mem_link_tx_pending() / check_legacy_tx_pending().  readl() only, so it
  * is safe to call under sm->lock.
  */
+/*
+ * UL pktproc descriptors published (fore) but not yet consumed by the CP
+ * (rear).  readl() only, so safe under sm->lock.  Downstream counts these as
+ * tx pending too (pktproc_ul_q_check_busy() in check_sbd_tx_pending()).
+ */
+static u32 s5xxx_ul_pending(struct s5xxx_modem *sm, u32 *rear_out)
+{
+	void __iomem *qinfo;
+	u32 n = S5XXX_PKTPROC_UL_Q1_NUM_DESC;
+	u32 fore, rear;
+
+	if (!sm->pktproc || !READ_ONCE(sm->ul_active))
+		return 0;
+	qinfo = sm->pktproc + S5XXX_PKTPROC_UL_INFO_OFS + 8 +
+		S5XXX_PKTPROC_UL_TXQ * 20;
+	fore = readl(qinfo + 12) % n;
+	rear = readl(qinfo + 16) % n;
+	if (rear_out)
+		*rear_out = rear;
+	return (fore + n - rear) % n;
+}
+
 static bool s5xxx_tx_pending(struct s5xxx_modem *sm)
 {
 	return readl(sm->ipc + S5XXX_FMT_TXQ_HEAD) !=
@@ -1184,6 +1238,8 @@ static irqreturn_t s5xxx_tx_state_irq(int irq, void *data)
  * the link may drop to save power.  Uses our existing (boot-bounce) link_up/down
  * with the same D3hot save/restore the boot re-link uses.
  */
+static void s5xxx_dl_relink_kick(struct s5xxx_modem *sm);
+
 static void s5xxx_pm_work(struct work_struct *work)
 {
 	struct s5xxx_modem *sm = container_of(work, struct s5xxx_modem, pm_work);
@@ -1241,6 +1297,7 @@ static void s5xxx_pm_work(struct work_struct *work)
 			sm->relink_failures = 0;
 			if (wake_debug)
 				dev_info(sm->dev, "CP wakeup: link up (MAIN armed)\n");
+			s5xxx_dl_relink_kick(sm);
 		} else {
 			/*
 			 * A CP can stay alive -- CP_ACTIVE and PS_HOLD high --
@@ -1304,15 +1361,17 @@ static void s5xxx_pm_work(struct work_struct *work)
 			 */
 			park = !sm->main_armed ||
 			       (!s5xxx_tx_pending(sm) && !sm->db_reserved &&
+				!s5xxx_ul_pending(sm, NULL) &&
 				time_after_eq(jiffies,
 					      READ_ONCE(sm->fmt_busy_until)));
 			if (park)
 				sm->link_up = false;
 			else if (wake_debug)
 				dev_info(sm->dev,
-					 "CP sleep: park skipped (tx pending %d, db %d, fmt busy %d)\n",
+					 "CP sleep: park skipped (tx pending %d, db %d, fmt busy %d, ul %u)\n",
 					 s5xxx_tx_pending(sm), sm->db_reserved,
-					 time_before(jiffies, READ_ONCE(sm->fmt_busy_until)));
+					 time_before(jiffies, READ_ONCE(sm->fmt_busy_until)),
+					 s5xxx_ul_pending(sm, NULL));
 			spin_unlock_irqrestore(&sm->lock, flags);
 
 			if (park) {
@@ -1713,6 +1772,7 @@ static void s5xxx_pktproc_publish_dl(struct s5xxx_modem *sm)
 {
 	void __iomem *info, *qinfo;
 	u32 cp_desc, cp_buff, hdr;
+	unsigned long flags;
 	int q;
 
 	if (!sm->pktproc) {
@@ -1721,6 +1781,13 @@ static void s5xxx_pktproc_publish_dl(struct s5xxx_modem *sm)
 		return;
 	}
 
+	/*
+	 * Hard-IRQ context (INIT_START): no sync timer delete.  The poll bails
+	 * while !online, and the cursor reset below is taken under dl_lock, so a
+	 * poll already running cannot interleave with it.
+	 */
+	timer_delete(&sm->dl_poll);
+	spin_lock_irqsave(&sm->dl_lock, flags);
 	info = sm->pktproc + S5XXX_PKTPROC_DL_INFO_OFS;
 	for (q = 0; q < S5XXX_PKTPROC_DL_NUM_QUEUE; q++) {
 		cp_desc = S5XXX_PKTPROC_CP_BASE + S5XXX_PKTPROC_DL_DESC_OFS +
@@ -1742,6 +1809,8 @@ static void s5xxx_pktproc_publish_dl(struct s5xxx_modem *sm)
 		sm->dl_fore[q] = S5XXX_PKTPROC_DL_NUM_DESC - 1;
 		sm->dl_done[q] = 0;
 	}
+	sm->dl_poll_left = 0;
+	spin_unlock_irqrestore(&sm->dl_lock, flags);
 	/* header last: num_queues:4 | desc_mode:2 | irq_mode:2 | max_packet_size:16 */
 	hdr = (S5XXX_PKTPROC_DL_NUM_QUEUE & 0xf) |
 	      ((S5XXX_PKTPROC_DL_DESC_MODE & 0x3) << 4) |
@@ -3093,15 +3162,18 @@ static void s5xxx_drain_fmt_rxq(struct s5xxx_modem *sm, u32 intval)
  * version nibble and hand it to the raw-IP netdev.  Bounded by num_desc so a
  * garbled rear pointer cannot spin.  Runs in the MSI hard-IRQ once ONLINE.
  */
-static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
+static u32 s5xxx_pktproc_dl_drain_locked(struct s5xxx_modem *sm)
 {
 	void __iomem *info = sm->pktproc + S5XXX_PKTPROC_DL_INFO_OFS;
 	u32 n = S5XXX_PKTPROC_DL_NUM_DESC;
+	u32 drained = 0;
 	int q;
+
+	lockdep_assert_held(&sm->dl_lock);
 
 	/* Pairs with the release in s5xxx_register_netdev(). */
 	if (!sm->pktproc || !smp_load_acquire(&sm->pdp_up))
-		return;
+		return 0;
 
 	if (READ_ONCE(sm->wake_rx_log) > 0) {
 		u32 h[S5XXX_PKTPROC_DL_NUM_QUEUE] = {};
@@ -3136,7 +3208,15 @@ static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
 		/* order the descriptor/buffer reads after the rear-ptr sample */
 		dma_rmb();
 
-		for (guard = 0; done != rear && guard < n; guard++) {
+		/*
+		 * The CP does not raise a fresh MSI for packets it adds while we
+		 * are draining (downstream polls with NAPI until the ring reads
+		 * empty), so re-sample rear after each pass; guard bounds the
+		 * whole drain to one ring's worth.
+		 */
+		guard = 0;
+again:
+		for (; done != rear && guard < n; guard++) {
 			void __iomem *d = descs +
 					  done * S5XXX_PKTPROC_DESC_SKTBUF_SZ;
 			u32 len = readl(d + 8) & 0xffff;	/* length @ byte 8 */
@@ -3175,6 +3255,14 @@ static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
 			netif_rx(skb);
 next:
 			done = (done + 1 == n) ? 0 : done + 1;
+			drained++;
+		}
+		if (guard < n) {
+			rear = readl(qinfo + 16) % n;
+			if (rear != done) {
+				dma_rmb();
+				goto again;
+			}
 		}
 		sm->dl_done[q] = done;
 
@@ -3200,6 +3288,121 @@ next:
 			writel(fore, qinfo + 12);
 		}
 	}
+	return drained;
+}
+
+/* Keep the safety poll running for at least @rounds more periods. */
+static void s5xxx_dl_poll_arm(struct s5xxx_modem *sm, unsigned int rounds)
+{
+	unsigned int ms = READ_ONCE(dl_poll_ms);
+
+	lockdep_assert_held(&sm->dl_lock);
+	if (!ms)
+		return;
+	if (sm->dl_poll_left < rounds)
+		sm->dl_poll_left = rounds;
+	if (!timer_pending(&sm->dl_poll))
+		mod_timer(&sm->dl_poll, jiffies + msecs_to_jiffies(ms));
+}
+
+/* MSI-0 path: drain, then make sure a lost follow-up MSI cannot strand. */
+static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&sm->dl_lock, flags);
+	if (s5xxx_pktproc_dl_drain_locked(sm))
+		s5xxx_dl_poll_arm(sm, S5XXX_DL_POLL_ROUNDS_TRAFFIC);
+	spin_unlock_irqrestore(&sm->dl_lock, flags);
+}
+
+static void s5xxx_dl_poll_fn(struct timer_list *t)
+{
+	struct s5xxx_modem *sm = timer_container_of(sm, t, dl_poll);
+	unsigned long flags;
+	u32 found;
+
+	bool rekick = false;
+	u32 ul, rear = 0;
+
+	if (!READ_ONCE(sm->online))
+		return;
+	spin_lock_irqsave(&sm->dl_lock, flags);
+	found = s5xxx_pktproc_dl_drain_locked(sm);
+	if (found) {
+		dl_stranded += found;
+		sm->dl_poll_left = S5XXX_DL_POLL_ROUNDS_TRAFFIC;
+	} else if (sm->dl_poll_left) {
+		sm->dl_poll_left--;
+	}
+	/*
+	 * UL: the CP owes us a consume.  A doorbell rung as the link went down
+	 * (or swallowed by a relink) is never repeated, so the descriptor -- a
+	 * TCP ACK, a request -- waits for the next uplink packet, which may be
+	 * the sender's retransmit seconds later.  Downstream's pktproc tx
+	 * hrtimer re-raises the interrupt while the queue stays busy; do the
+	 * same when rear has not moved for S5XXX_UL_REKICK_POLLS polls.
+	 */
+	ul = s5xxx_ul_pending(sm, &rear);
+	if (ul) {
+		if (rear == sm->ul_watch_rear) {
+			if (++sm->ul_watch_polls >= S5XXX_UL_REKICK_POLLS) {
+				sm->ul_watch_polls = 0;
+				rekick = true;
+			}
+		} else {
+			sm->ul_watch_rear = rear;
+			sm->ul_watch_polls = 0;
+		}
+		if (sm->dl_poll_left < S5XXX_DL_POLL_ROUNDS_TRAFFIC)
+			sm->dl_poll_left = S5XXX_DL_POLL_ROUNDS_TRAFFIC;
+	} else {
+		sm->ul_watch_polls = 0;
+	}
+	if (sm->dl_poll_left && READ_ONCE(dl_poll_ms))
+		mod_timer(&sm->dl_poll,
+			  jiffies + msecs_to_jiffies(READ_ONCE(dl_poll_ms)));
+	spin_unlock_irqrestore(&sm->dl_lock, flags);
+	if (found)
+		dev_info_ratelimited(sm->dev,
+			"DL poll: %u packet(s) had no MSI (total %u)\n",
+			found, dl_stranded);
+	if (rekick) {
+		ul_rekicks++;
+		dev_info_ratelimited(sm->dev,
+			"UL poll: %u descriptor(s) unconsumed, re-ringing (total %u)\n",
+			ul, ul_rekicks);
+		s5xxx_send_ipc_irq(sm, S5XXX_INT_VALID | S5XXX_INT_SEND_RAW);
+	}
+}
+
+/* After publishing uplink: watch the ring until the CP has consumed it. */
+static void s5xxx_ul_watch(struct s5xxx_modem *sm)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&sm->dl_lock, flags);
+	s5xxx_dl_poll_arm(sm, S5XXX_DL_POLL_ROUNDS_TRAFFIC);
+	spin_unlock_irqrestore(&sm->dl_lock, flags);
+}
+
+/* After a relink: MSIs raised while the link was down are gone. */
+static void s5xxx_dl_relink_kick(struct s5xxx_modem *sm)
+{
+	unsigned long flags;
+	u32 found;
+
+	if (!READ_ONCE(sm->online))
+		return;
+	spin_lock_irqsave(&sm->dl_lock, flags);
+	found = s5xxx_pktproc_dl_drain_locked(sm);
+	dl_relink_found += found;
+	s5xxx_dl_poll_arm(sm, S5XXX_DL_POLL_ROUNDS_RELINK);
+	spin_unlock_irqrestore(&sm->dl_lock, flags);
+	if (found)
+		dev_info_ratelimited(sm->dev,
+			"relink: %u DL packet(s) were waiting (total %u)\n",
+			found, dl_relink_found);
 }
 
 /*
@@ -3325,6 +3528,7 @@ static bool s5xxx_pktproc_ul_xmit(struct s5xxx_modem *sm, struct sk_buff *skb,
 	dev_dbg_ratelimited(sm->dev, "UL lcid %#x len %u dsize %u\n",
 			     lcid, skb->len, dsize);
 	s5xxx_send_ipc_irq(sm, S5XXX_INT_VALID | S5XXX_INT_SEND_RAW);
+	s5xxx_ul_watch(sm);
 	return true;
 }
 
@@ -5075,6 +5279,8 @@ static int s5xxx_probe(struct platform_device *pdev)
 
 	spin_lock_init(&sm->lock);
 	spin_lock_init(&sm->tx_lock);
+	spin_lock_init(&sm->dl_lock);
+	timer_setup(&sm->dl_poll, s5xxx_dl_poll_fn, 0);
 	mutex_init(&sm->pcie_onoff_lock);
 	init_completion(&sm->init_done);
 	init_completion(&sm->gnss_rsp);
@@ -5437,6 +5643,7 @@ err_irq:
 		free_irq(pci_irq_vector(sm->pdev, 1), sm);
 err_irq0:
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	timer_shutdown_sync(&sm->dl_poll);
 err_vectors:
 	pci_free_irq_vectors(sm->pdev);
 err_disable:
@@ -5475,6 +5682,7 @@ static void s5xxx_remove(struct platform_device *pdev)
 	if (sm->nvec > 1)
 		free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	timer_shutdown_sync(&sm->dl_poll);
 	/* Main IRQ gone -> no more DL drains or RFS enqueues. */
 	for (i = 0; i < S5XXX_PDP_CH_COUNT; i++)
 		if (sm->ndev[i])
@@ -5632,6 +5840,7 @@ static void s5xxx_shutdown(struct platform_device *pdev)
 	if (sm->nvec > 1)
 		free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
+	timer_shutdown_sync(&sm->dl_poll);
 	cancel_work_sync(&sm->rfs_work);
 	dev_info(sm->dev, "quiesced for shutdown\n");
 }
