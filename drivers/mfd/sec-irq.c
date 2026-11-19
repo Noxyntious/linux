@@ -6,12 +6,16 @@
 #include <linux/array_size.h>
 #include <linux/build_bug.h>
 #include <linux/dev_printk.h>
+#include <linux/device.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/mfd/samsung/core.h>
 #include <linux/mfd/samsung/irq.h>
 #include <linux/mfd/samsung/s2mpg10.h>
 #include <linux/mfd/samsung/s2mpg11.h>
+#include <linux/mfd/samsung/s2mpg14.h>
+#include <linux/mfd/syscon.h>
+#include <linux/slab.h>
 #include <linux/mfd/samsung/s2mps11.h>
 #include <linux/mfd/samsung/s2mps14.h>
 #include <linux/mfd/samsung/s2mpu02.h>
@@ -325,6 +329,78 @@ static const struct regmap_irq_chip s2mpg10_irq_chip_pmic = {
 	.num_irqs = ARRAY_SIZE(s2mpg10_pmic_irqs),
 };
 
+/*
+ * S2MPG14 (zuma main PMIC). The common block is not S2MPG10's: COMMON 0x01/
+ * 0x02 are VGPIO1/VGPIO2 there, and the interrupt source / mask are IBI0
+ * (0x05, bit 0 PMIC) / IBIM1 (0x0f, bit 0 PMIC, bit 1 meter). The PMIC block
+ * has five INT registers (INT1..INT5 0x00-0x04, INT1M..INT5M 0x05-0x09)
+ * against S2MPG10's six, so S2MPG10's mask writes all landed one register
+ * off and the RTC alarm was never unmasked. INT1 and INT2 carry the same
+ * bits as on S2MPG10 (downstream s2mpg14-irq.c), so the S2MPG10 interrupt
+ * numbers are kept: the RTC cell asks for S2MPG10_IRQ_RTCA0.
+ */
+static const struct regmap_irq s2mpg14_irqs[] = {
+	REGMAP_IRQ_REG(S2MPG10_COMMON_IRQ_PMIC, 0, S2MPG14_COMMON_INT_SRC_PMIC),
+	/* meter and the reserved bits: declared so they stay masked */
+	REGMAP_IRQ_REG(S2MPG10_COMMON_IRQ_UNUSED, 0, GENMASK(7, 1)),
+};
+
+static const struct regmap_irq s2mpg14_pmic_irqs[] = {
+	REGMAP_IRQ_REG(S2MPG10_IRQ_PWRONF, 0, S2MPG10_IRQ_PWRONF_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_PWRONR, 0, S2MPG10_IRQ_PWRONR_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_JIGONBF, 0, S2MPG10_IRQ_JIGONBF_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_JIGONBR, 0, S2MPG10_IRQ_JIGONBR_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_ACOKBF, 0, S2MPG10_IRQ_ACOKBF_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_ACOKBR, 0, S2MPG10_IRQ_ACOKBR_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_PWRON1S, 0, S2MPG10_IRQ_PWRON1S_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_MRB, 0, S2MPG10_IRQ_MRB_MASK),
+
+	REGMAP_IRQ_REG(S2MPG10_IRQ_RTC60S, 1, S2MPG10_IRQ_RTC60S_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_RTCA1, 1, S2MPG10_IRQ_RTCA1_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_RTCA0, 1, S2MPG10_IRQ_RTCA0_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_RTC1S, 1, S2MPG10_IRQ_RTC1S_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_WTSR_COLDRST, 1, S2MPG10_IRQ_WTSR_COLDRST_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_WTSR, 1, S2MPG10_IRQ_WTSR_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_WRST, 1, S2MPG10_IRQ_WRST_MASK),
+	REGMAP_IRQ_REG(S2MPG10_IRQ_SMPL, 1, S2MPG10_IRQ_SMPL_MASK),
+};
+
+static const struct regmap_irq_chip s2mpg14_irq_chip = {
+	.name = "s2mpg14",
+	.status_base = S2MPG14_COMMON_IBI0,
+	.mask_base = S2MPG14_COMMON_IBIM1,
+	.num_regs = 1,
+	.irqs = s2mpg14_irqs,
+	.num_irqs = ARRAY_SIZE(s2mpg14_irqs),
+};
+
+static const struct regmap_irq_chip s2mpg14_irq_chip_pmic = {
+	.name = "s2mpg14-pmic",
+	.domain_suffix = "pmic",
+	.status_base = S2MPG14_PMIC_INT1,
+	.mask_base = S2MPG14_PMIC_INT1M,
+	.num_regs = 5,
+	.irqs = s2mpg14_pmic_irqs,
+	.num_irqs = ARRAY_SIZE(s2mpg14_pmic_irqs),
+};
+
+/*
+ * On zuma the PMIC's IBI reaches the GIC (SPI 74, level) through the
+ * VGPIO2AP combiner, whose pending bit has to be cleared before the PMIC is
+ * read, or the line stays asserted (downstream s2mpg14_irq_thread()).
+ */
+#define ZUMA_VGPIO2AP_INTC0_IPEND	0x290
+
+static int s2mpg14_irq_pre(void *data)
+{
+	struct regmap *sysreg = data;
+	unsigned int val;
+
+	if (!regmap_read(sysreg, ZUMA_VGPIO2AP_INTC0_IPEND, &val))
+		regmap_write(sysreg, ZUMA_VGPIO2AP_INTC0_IPEND, val);
+	return 0;
+}
+
 static const struct regmap_irq_chip s2mpg11_irq_chip = {
 	.name = "s2mpg11",
 	.status_base = S2MPG11_COMMON_INT,
@@ -457,11 +533,32 @@ static struct regmap_irq_chip_data *sec_irq_init_s2mpg1x(struct sec_pmic_dev *se
 		chained_irq_chip = &s2mpg11_irq_chip_pmic;
 		chained_pirq = S2MPG11_COMMON_IRQ_PMIC;
 		break;
-	case S2MPG14:
-		irq_chip = &s2mpg10_irq_chip;
-		chained_irq_chip = &s2mpg10_irq_chip_pmic;
+	case S2MPG14: {
+		struct regmap *sysreg;
+		struct regmap_irq_chip *chip;
+
+		irq_chip = &s2mpg14_irq_chip;
+		chained_irq_chip = &s2mpg14_irq_chip_pmic;
 		chained_pirq = S2MPG10_COMMON_IRQ_PMIC;
+
+		sysreg = syscon_regmap_lookup_by_phandle_optional(sec_pmic->dev->of_node,
+								  "samsung,vgpio2ap-sysreg");
+		if (IS_ERR(sysreg))
+			return ERR_CAST(sysreg);
+		if (sysreg) {
+			chip = devm_kmemdup(sec_pmic->dev, irq_chip, sizeof(*chip),
+					    GFP_KERNEL);
+			if (!chip)
+				return ERR_PTR(-ENOMEM);
+			chip->handle_pre_irq = s2mpg14_irq_pre;
+			chip->irq_drv_data = sysreg;
+			irq_chip = chip;
+		} else {
+			dev_warn(sec_pmic->dev,
+				 "no samsung,vgpio2ap-sysreg: the IRQ line may stay asserted\n");
+		}
 		break;
+	}
 	case S2MPG15:
 		irq_chip = &s2mpg11_irq_chip;
 		chained_irq_chip = &s2mpg11_irq_chip_pmic;

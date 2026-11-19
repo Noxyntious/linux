@@ -401,11 +401,24 @@
  * through that combiner.  SPI 75 (IRQB_M, the Pixel 9 boards' number) never
  * fires on zuma, so the RTC alarm never reached Linux.
  */
+&soc {
+	/*
+	 * VGPIO2AP combiner of zuma (downstream zuma-pmic.dtsi
+	 * "sysreg_vgpio2ap"): INTC0_IPEND (+0x290) has to be cleared before the
+	 * PMIC is read, or the level SPI 74 stays asserted.
+	 */
+	sysreg_vgpio2ap: syscon@15090000 {
+		compatible = "google,zuma-vgpio2ap-sysreg", "syscon";
+		reg = <0x15090000 0x1000>;
+	};
+};
+
 &acpm_ipc {
 	pmic-1 {
 		compatible = "samsung,s2mpg14-pmic";
 		interrupt-parent = <&gic>;
 		interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH 0>;
+		samsung,vgpio2ap-sysreg = <&sysreg_vgpio2ap>;
 		/* RTC alarm wakes the system */
 		wakeup-source;
 
