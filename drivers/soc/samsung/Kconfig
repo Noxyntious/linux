@@ -81,6 +81,15 @@ config S2MPG1415_METER
 	  through debugfs, which is what makes idle power attributable rather
 	  than guessed at from battery current.
 
+config ZUMA_MIF_DVFS
+	tristate "Google Tensor G3 MIF/INT bus frequency scaling"
+	depends on (ARCH_EXYNOS && EXYNOS_ACPM_PROTOCOL) || COMPILE_TEST
+	depends on CPU_FREQ && PM_DEVFREQ && COMMON_CLK
+	help
+	  Scales the memory interface (MIF) and internal bus (INT) clocks of
+	  the Tensor G3 with the CPU clusters' and the GPU's frequency,
+	  instead of leaving them at the bootloader's fixed rate.
+
 config EXYNOS_GSA
 	tristate "Google GSA security-core mailbox driver"
 	depends on ARCH_EXYNOS || ((ARM || ARM64) && COMPILE_TEST)

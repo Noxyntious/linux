@@ -442,6 +442,20 @@
 	/delete-node/ opp-940000000;
 };
 
+/ {
+	/*
+	 * MIF/INT bus scaling: the buses follow the CPU clusters' and the
+	 * GPU's frequency instead of staying at the bootloader's 2028/356 MHz.
+	 */
+	mif-dvfs {
+		compatible = "google,zuma-mif-dvfs";
+		clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_MIF>,
+			 <&acpm_ipc GS101_CLK_ACPM_DVFS_INT>;
+		clock-names = "mif", "int";
+		google,gpu-devfreq = <&gpu>;
+	};
+};
+
 &soc {
 	/*
 	 * BLK_HSI2 DMA firewall (UFS, Wi-Fi PCIe). Out of reset an S2MPU blocks
