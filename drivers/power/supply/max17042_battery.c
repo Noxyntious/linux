@@ -22,6 +22,7 @@
 #include <linux/power/max17042_battery.h>
 #include <linux/of.h>
 #include <linux/regmap.h>
+#include <linux/thermal.h>
 
 /* Status register bits */
 #define STATUS_POR_BIT         (1 << 1)
@@ -141,6 +142,30 @@ static int max17042_get_temperature(struct max17042_chip *chip, int *temp)
 	*temp = *temp * 10 * MAX17042_TEMPERATURE_LSB;
 	return 0;
 }
+
+/*
+ * The battery thermistor as an OF thermal sensor, so that a board can hang a
+ * thermal zone (and cooling maps) on it.  Phones have no other sensor this
+ * close to the back cover: the cell sits under it, and on the Pixel 8 Pro the
+ * battery temperature tracks the case to within a few degrees, which makes it
+ * the stand-in for the skin temperature the vendor thermal stack regulates.
+ */
+static int max17042_tz_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct max17042_chip *chip = thermal_zone_device_priv(tz);
+	int ret, dc;
+
+	ret = max17042_get_temperature(chip, &dc);
+	if (ret)
+		return ret;
+
+	*temp = dc * 100;	/* deci-centigrade -> milli-centigrade */
+	return 0;
+}
+
+static const struct thermal_zone_device_ops max17042_tz_ops = {
+	.get_temp = max17042_tz_get_temp,
+};
 
 static int max17042_get_status(struct max17042_chip *chip, int *status)
 {
@@ -1781,6 +1806,16 @@ static int max17042_probe(struct i2c_client *client, struct device *dev, int irq
 	}
 
 	max17042_setup_thermistor(chip);
+
+	/* Optional: only boards with a thermal zone on the gauge get one. */
+	if (of_property_present(dev->of_node, "#thermal-sensor-cells")) {
+		struct thermal_zone_device *tz;
+
+		tz = devm_thermal_of_zone_register(dev, 0, chip,
+						   &max17042_tz_ops);
+		if (IS_ERR(tz) && PTR_ERR(tz) != -ENODEV)
+			dev_warn(dev, "battery thermal zone: %pe\n", tz);
+	}
 
 	return 0;
 }

@@ -663,7 +663,7 @@
 		};
 	};
 
-	fuel-gauge@36 {
+	fuel_gauge: fuel-gauge@36 {
 		compatible = "maxim,max77759-fg";
 		reg = <0x36>;
 		pinctrl-0 = <&if_pmic_fg_int>;
@@ -672,6 +672,8 @@
 		/* maxim,rsense-default 500 (10 uOhm units) */
 		shunt-resistor-micro-ohms = <5000>;
 		monitored-battery = <&battery>;
+		/* the battery thermistor feeds skin-thermal below */
+		#thermal-sensor-cells = <0>;
 		/*
 		 * Battery thermistor, as husky's vendor battery profile
 		 * (zuma-husky-battery-data.dtsi: TGain, TOff, Curve). Without
@@ -1276,4 +1278,73 @@
  */
 &pd_hsi0 {
 	samsung,always-on;
+};
+
+/*
+ * Skin temperature control.  The die zones (zumapro.dtsi) only cap each
+ * cluster's own hot spot at 70 C; nothing looked at how hot the phone gets
+ * in the hand, which under steady load (Waydroid apps, 5G) was "unbearably
+ * hot" long before any die zone acted.  The vendor stack regulates a modelled
+ * skin temperature instead.  The closest sensor we have is the battery
+ * thermistor under the back cover, so one IPA zone on it shares a power
+ * budget between all three CPU clusters and the GPU.
+ *
+ * The zone is slow: the cell's thermal mass smooths everything into minutes,
+ * which is what a skin limit should do anyway (bursts stay fast, sustained
+ * load settles).  Single passive trip = always-on IPA.  Userspace sets it
+ * proportional-only (udev: k_i 0, k_po 300): with the cell this slow an
+ * integral term winds up for minutes and pins everything at its lowest
+ * clocks after the case has cooled.  41 C on the cell keeps the back cover
+ * comfortable; the
+ * charge governor (husky-charge-thermal) separately backs the charge current
+ * off from 40 C, so a hot charge is not paid for in CPU speed alone.
+ */
+&{/thermal-zones} {
+	skin-thermal {
+		polling-delay = <2000>;
+		/*
+		 * IPA splits the budget by each actor's current demand, so an
+		 * idle cluster or GPU is granted next to nothing and sits at its
+		 * lowest OPP until the next poll sees its load: poll fast while
+		 * above the trip so they come back within a quarter second.
+		 */
+		polling-delay-passive = <250>;
+		thermal-sensors = <&fuel_gauge>;
+		/* CPU + GPU budget the case sheds at the trip, before tuning */
+		sustainable-power = <2200>;
+
+		trips {
+			skin_alert: control {
+				temperature = <41000>;
+				hysteresis = <1000>;
+				type = "passive";
+			};
+
+			/* a cell this hot is a hazard: orderly power-off */
+			skin_crit: critical {
+				temperature = <60000>;
+				hysteresis = <1000>;
+				type = "critical";
+			};
+		};
+
+		cooling-maps {
+			map0 {
+				trip = <&skin_alert>;
+				cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+			map1 {
+				trip = <&skin_alert>;
+				cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+			map2 {
+				trip = <&skin_alert>;
+				cooling-device = <&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+			map3 {
+				trip = <&skin_alert>;
+				cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
 };
