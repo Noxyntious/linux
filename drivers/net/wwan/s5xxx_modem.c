@@ -2377,11 +2377,14 @@ static int s5xxx_oem_tx(struct wwan_port *port, struct sk_buff *skb)
  * from the IRQ handler) rather than dropping the frame.  The retry overwrites
  * @ret with the next send's status, so a positive wait return never leaks out.
  */
+#define S5XXX_FMT_TX_POLL_MS	5
+
 static int s5xxx_oem_tx_blocking(struct wwan_port *port, struct sk_buff *skb)
 {
 	struct s5xxx_oem_ch *oc = wwan_port_get_drvdata(port);
 	struct s5xxx_modem *sm = oc->sm;
 	u32 needed = round_up(S5XXX_SIT_HDR + skb->len, 8);
+	unsigned long deadline;
 	int ret;
 
 	if (!sm->online)
@@ -2389,18 +2392,30 @@ static int s5xxx_oem_tx_blocking(struct wwan_port *port, struct sk_buff *skb)
 	if (skb->len > S5XXX_FMT_MAX)
 		return -EMSGSIZE;
 
+	deadline = jiffies + HZ;
 	for (;;) {
 		ret = s5xxx_fmt_ring_tx(sm, oc->ch, &oc->ch_seq,
 					S5XXX_FMT_MAX, skb->data, skb->len);
 		if (ret != -EBUSY)
 			break;
+		/*
+		 * The CP drains the FMT txq without raising an interrupt, so
+		 * fmt_tx_wq is often never woken: poll for the space too.  With a
+		 * plain 1 s wait every ~4 KB oem frame (each one fills the 4 KB
+		 * ring) slept the whole second -- the boot-time uecap fetch (215 KB,
+		 * 54 frames) took 54 s and held every SIT reply queued behind it,
+		 * so ModemManager's enable stalled for a minute.
+		 */
 		ret = wait_event_interruptible_timeout(sm->fmt_tx_wq,
-				s5xxx_fmt_txq_space(sm) >= needed, HZ);
-		if (ret == 0)
-			ret = -ETIMEDOUT;
+				s5xxx_fmt_txq_space(sm) >= needed,
+				msecs_to_jiffies(S5XXX_FMT_TX_POLL_MS));
 		if (ret < 0)
 			break;
-		/* Space appeared; retry the send. */
+		if (!ret && time_after(jiffies, deadline)) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+		/* Space appeared (or poll again); retry the send. */
 	}
 
 	if (ret)
