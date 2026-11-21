@@ -441,6 +441,17 @@ int brcmf_feat_attach(struct brcmf_pub *drvr)
 	case BRCM_CC_4329_CHIP_ID:
 		drvr->chip_quirks |= BIT(BRCMF_FEAT_QUIRK_NEED_MPC);
 		break;
+	case BRCM_CC_4398_CHIP_ID:
+		/*
+		 * Pixel 8 Pro: no Wi-Fi Direct. With P2P advertised,
+		 * wpa_supplicant asks for a P2P device interface every time the
+		 * dongle comes up; on this firmware brcmf_p2p_create_p2pdev()
+		 * times out ("P2P: Failed to enable P2P Device interface"),
+		 * which cost ~2.3 s of every Wi-Fi bring-up. Access-point mode
+		 * (internet sharing) does not depend on it.
+		 */
+		drvr->feat_flags &= ~BIT(BRCMF_FEAT_P2P);
+		break;
 	default:
 		/* no quirks */
 		break;

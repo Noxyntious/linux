@@ -829,6 +829,45 @@ static void exynos_pcie_remove(struct platform_device *pdev)
 		regulator_bulk_disable(ARRAY_SIZE(ep->supplies), ep->supplies);
 }
 
+/*
+ * Wi-Fi across system sleep, the way stock Android does it (use-pcieon-sleep
+ * "false" in the vendor DT): the link goes down, but WLAN_EN stays high, so
+ * the BCM4398 keeps its firmware running -- and its association -- in D3.
+ * brcmfmac sends D3_INFORM before this (warm_pm) and D0_INFORM after resume.
+ * 0 = the old cold behaviour: WLAN_EN dropped, firmware reloaded on wake.
+ */
+static bool wlan_keep = true;
+module_param(wlan_keep, bool, 0644);
+MODULE_PARM_DESC(wlan_keep, "Keep the Wi-Fi endpoint powered (WLAN_EN) across system sleep");
+
+/* PME_Turn_Off -> PM_TO_ACK -> L2_IDLE on a Wi-Fi link that is up. */
+static void exynos_pcie_wlan_enter_l2(struct exynos_pcie *ep)
+{
+	void __iomem *elbi = ep->pci.elbi_base;
+	u32 val;
+	int ret;
+
+	val = exynos_pcie_readl(elbi, PCIE_ZUMA_RDLH_LINKUP) & LTSSM_STATE_MASK;
+	if (val < LTSSM_STATE_RCVRY_LOCK || val > LTSSM_STATE_L1_IDLE) {
+		dev_info(ep->pci.dev, "wlan: link not up for L2 (ltssm %#x)\n", val);
+		return;
+	}
+	val = exynos_pcie_readl(elbi, PCIE_IRQ_PULSE);
+	exynos_pcie_writel(elbi, val, PCIE_IRQ_PULSE);	/* stale PM_TO_ACK */
+	exynos_pcie_writel(elbi, 1, PCIE_XMIT_PME_TURNOFF);
+	ret = readl_poll_timeout(elbi + PCIE_IRQ_PULSE, val, val & IRQ_RADM_PM_TO_ACK,
+				 PCIE_L2_ENTER_WAIT_STEP_US, PCIE_L2_ENTER_WAIT_US);
+	if (ret)
+		dev_warn(ep->pci.dev, "wlan: no PM_TO_ACK (irq %#x)\n", val);
+	udelay(10);
+	exynos_pcie_writel(elbi, 0, PCIE_XMIT_PME_TURNOFF);
+	ret = readl_poll_timeout(elbi + PCIE_ZUMA_RDLH_LINKUP, val,
+				 (val & LTSSM_STATE_MASK) == LTSSM_STATE_L2_IDLE,
+				 PCIE_L2_ENTER_WAIT_STEP_US, PCIE_L2_ENTER_WAIT_US);
+	dev_info(ep->pci.dev, "wlan: link %s L2_IDLE (ltssm %#x)\n",
+		 ret ? "did NOT reach" : "in", val & LTSSM_STATE_MASK);
+}
+
 static int exynos_pcie_suspend_noirq(struct device *dev)
 {
 	struct exynos_pcie *ep = dev_get_drvdata(dev);
@@ -866,18 +905,22 @@ static int exynos_pcie_suspend_noirq(struct device *dev)
 	}
 
 	/*
-	 * Wi-Fi RC (the one with a WLAN_EN line): power the endpoint off
-	 * across the sleep, so that resume repeats the cold bring-up of probe
-	 * (WLAN_EN, then PERST release in start_link). A chip that stays up
-	 * comes back behind a link-down reset with its config space (BAR0
-	 * window) lost and its firmware no longer answering. Userspace removes
-	 * the endpoint before sleeping and rescans after resume, so brcmfmac
-	 * probes a fresh chip exactly as at boot. The modem RC parks its own
-	 * link and must not have its CP reset here.
+	 * Wi-Fi RC (the one with a WLAN_EN line). wlan_keep (default): orderly
+	 * L2, PERST, WLAN_EN left high -- the dongle's firmware survives in D3
+	 * and brcmfmac restores its config-space windows and sends D0_INFORM on
+	 * resume. !wlan_keep: power it off, and resume repeats the cold
+	 * bring-up of probe (WLAN_EN, then PERST release in start_link). The
+	 * modem RC parks its own link and must not have its CP reset here.
 	 */
 	if (ep->drvdata->zuma && ep->wlan_gpio) {
-		gpiod_set_value_cansleep(ep->perst_gpio, 0);
-		gpiod_set_value_cansleep(ep->wlan_gpio, 0);
+		if (wlan_keep) {
+			/* warm: firmware stays up in D3; only the link goes */
+			exynos_pcie_wlan_enter_l2(ep);
+			gpiod_set_value_cansleep(ep->perst_gpio, 0);
+		} else {
+			gpiod_set_value_cansleep(ep->perst_gpio, 0);
+			gpiod_set_value_cansleep(ep->wlan_gpio, 0);
+		}
 	}
 
 	exynos_pcie_assert_core_reset(ep);

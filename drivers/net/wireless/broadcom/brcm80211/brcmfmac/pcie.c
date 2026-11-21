@@ -469,6 +469,10 @@ struct brcmf_pciedev_info {
 	struct work_struct trap_work;
 	/* wlan_power: dongle torn down (no netdev) for system sleep */
 	bool wlan_off;
+	/* warm_pm: the vendor config windows across D3 (lost with the link) */
+	u32 d3_bar0_win, d3_bar1_win;
+	bool d3_warm;			/* in D3 with the firmware kept running */
+	struct work_struct reload_work;	/* firmware lost in sleep: reload it */
 	struct mutex wlan_power_lock;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
@@ -3473,6 +3477,7 @@ static void brcmf_pcie_enable_l1ss(struct brcmf_pciedev_info *devinfo)
 	bphy_err(bus->drvr, "L1SS: full L1SS + ASPM-L1 enabled\n");
 }
 
+static void brcmf_pcie_reload_worker(struct work_struct *work);
 static void brcmf_pcie_trap_worker(struct work_struct *work)
 {
 	struct brcmf_pciedev_info *devinfo =
@@ -4037,6 +4042,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	timer_setup(&devinfo->timer, brcmf_pcie_fwcon, 0);
 #endif
 	INIT_WORK(&devinfo->trap_work, brcmf_pcie_trap_worker);
+	INIT_WORK(&devinfo->reload_work, brcmf_pcie_reload_worker);
 	mutex_init(&devinfo->wlan_power_lock);
 
 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
@@ -4093,6 +4099,7 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	devinfo->trap_seen = true;	/* no new trap work from here on */
 	cancel_work_sync(&devinfo->trap_work);
+	cancel_work_sync(&devinfo->reload_work);
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	if (devinfo->poll_active) {
@@ -4251,9 +4258,30 @@ MODULE_PARM_DESC(halt_mode, "How wlan_power 0 halts the firmware before the chip
 
 #define BRCMF_H2D_FW_TRAP_WORD		0x20000000
 
-static bool brcmf_pcie_cold_pm(struct brcmf_pciedev_info *devinfo)
+/*
+ * warm_pm (default): the BCM4398 sleeps the way it does under Android. The
+ * host sends D3_INFORM (over the control ring: mb_via_ctl), the firmware acks
+ * and stays up -- associated -- while the root port takes the link to L2 and
+ * asserts PERST with WLAN_EN left high (pci-exynos wlan_keep). On resume the
+ * link retrains, the PCI core restores the standard config space, we put back
+ * the two vendor windows it does not know about (BAR0/BAR1 at 0x80/0x84, as
+ * dhd's dhdpcie_config_restore does) BEFORE touching BAR0, and D0_INFORM
+ * resumes the firmware: Wi-Fi is back at once instead of after a firmware
+ * reload, scan, association and DHCP (~20 s).
+ * !warm_pm: the old cold path (wlan_power 0/1 from userspace around sleep).
+ */
+static bool brcmf_warm_pm = true;
+module_param_named(warm_pm, brcmf_warm_pm, bool, 0644);
+MODULE_PARM_DESC(warm_pm, "BCM4398: keep the firmware running across system sleep (D3_INFORM/D0_INFORM)");
+
+static bool brcmf_pcie_is_4398(struct brcmf_pciedev_info *devinfo)
 {
 	return devinfo->ci && devinfo->ci->chip == BRCM_CC_4398_CHIP_ID;
+}
+
+static bool brcmf_pcie_cold_pm(struct brcmf_pciedev_info *devinfo)
+{
+	return brcmf_pcie_is_4398(devinfo) && !brcmf_warm_pm;
 }
 
 static int brcmf_pcie_wlan_power_off(struct brcmf_pciedev_info *devinfo)
@@ -4339,7 +4367,7 @@ static ssize_t wlan_power_store(struct device *dev, struct device_attribute *att
 	err = kstrtobool(buf, &on);
 	if (err)
 		return err;
-	if (!brcmf_pcie_cold_pm(devinfo))
+	if (!brcmf_pcie_is_4398(devinfo))
 		return -EOPNOTSUPP;
 
 	mutex_lock(&devinfo->wlan_power_lock);
@@ -4356,11 +4384,118 @@ static struct attribute *brcmf_pcie_attrs[] = {
 };
 ATTRIBUTE_GROUPS(brcmf_pcie);
 
+/* warm_pm: the firmware did not survive the sleep -- reload it on the same
+ * PCI device (the bus-reset path that works; remove + probe does not). */
+static void brcmf_pcie_reload_worker(struct work_struct *work)
+{
+	struct brcmf_pciedev_info *devinfo =
+		container_of(work, struct brcmf_pciedev_info, reload_work);
+
+	mutex_lock(&devinfo->wlan_power_lock);
+	if (!devinfo->wlan_off) {
+		devinfo->state = BRCMFMAC_PCIE_STATE_UP;	/* for the teardown */
+		brcmf_pcie_wlan_power_off(devinfo);
+	}
+	brcmf_pcie_wlan_power_on(devinfo);
+	mutex_unlock(&devinfo->wlan_power_lock);
+}
+
+static int brcmf_pcie_warm_suspend(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	struct pci_dev *pdev = devinfo->pdev;
+
+	devinfo->d3_warm = false;
+	if (devinfo->wlan_off || devinfo->state != BRCMFMAC_PCIE_STATE_UP)
+		return 0;	/* already down (wlan_power 0), or still loading */
+
+	if (devinfo->poll_active) {
+		devinfo->poll_active = false;
+		cancel_delayed_work_sync(&devinfo->poll_work);
+	}
+	brcmf_pcie_fwcon_timer(devinfo, false);
+
+	devinfo->mbdata_completed = false;
+	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
+	wait_event_timeout(devinfo->mbdata_resp_wait, devinfo->mbdata_completed,
+			   BRCMF_PCIE_MBDATA_TIMEOUT);
+	if (!devinfo->mbdata_completed) {
+		/*
+		 * No D3_ACK: do not block the system sleep over it (autosleep
+		 * would retry forever). Take the dongle down cold instead; it
+		 * is reloaded after resume.
+		 */
+		dev_warn(dev, "warm_pm: no D3_ACK, sleeping cold\n");
+		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		mutex_lock(&devinfo->wlan_power_lock);
+		brcmf_pcie_wlan_power_off(devinfo);
+		mutex_unlock(&devinfo->wlan_power_lock);
+		return 0;
+	}
+
+	brcmf_pcie_intr_disable(devinfo);
+	synchronize_irq(pdev->irq);
+	pci_read_config_dword(pdev, BRCMF_PCIE_BAR0_WINDOW, &devinfo->d3_bar0_win);
+	pci_read_config_dword(pdev, BRCMF_PCIE_BAR1_WINDOW, &devinfo->d3_bar1_win);
+	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	devinfo->d3_warm = true;
+	dev_info(dev, "warm_pm: in D3, firmware kept running\n");
+	return 0;
+}
+
+static int brcmf_pcie_warm_resume(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	struct pci_dev *pdev = devinfo->pdev;
+
+	if (!devinfo->d3_warm) {
+		/* slept cold (no D3_ACK): bring it back the slow way */
+		if (devinfo->wlan_off)
+			schedule_work(&devinfo->reload_work);
+		return 0;
+	}
+	devinfo->d3_warm = false;
+
+	/* A link that did not come back would turn every BAR access into an
+	 * SError (the old "hot resume hung the phone"): touch nothing. */
+	if (!pci_device_is_present(pdev)) {
+		dev_err(dev, "warm_pm: endpoint gone after resume (link down?)\n");
+		return 0;
+	}
+	pci_write_config_dword(pdev, BRCMF_PCIE_BAR0_WINDOW, devinfo->d3_bar0_win);
+	pci_write_config_dword(pdev, BRCMF_PCIE_BAR1_WINDOW, devinfo->d3_bar1_win);
+	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+
+	if (brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask) == 0) {
+		dev_warn(dev, "warm_pm: firmware lost in sleep, reloading\n");
+		schedule_work(&devinfo->reload_work);
+		return 0;
+	}
+	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+	if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM)) {
+		dev_warn(dev, "warm_pm: D0_INFORM failed, reloading\n");
+		schedule_work(&devinfo->reload_work);
+		return 0;
+	}
+	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+	brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+	brcmf_pcie_intr_enable(devinfo);
+	brcmf_pcie_hostready(devinfo);
+	brcmf_pcie_fwcon_timer(devinfo, true);
+	dev_info(dev, "warm_pm: hot resume\n");
+	return 0;
+}
+
 static int brcmf_pcie_pm_suspend(struct device *dev)
 {
 	struct brcmf_bus *bus = dev_get_drvdata(dev);
 	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
 
+	if (brcmf_pcie_is_4398(devinfo) && brcmf_warm_pm)
+		return brcmf_pcie_warm_suspend(dev);
 	if (!brcmf_pcie_cold_pm(devinfo))
 		return brcmf_pcie_pm_enter_D3(dev);
 	if (!devinfo->wlan_off) {
@@ -4375,6 +4510,8 @@ static int brcmf_pcie_pm_resume(struct device *dev)
 	struct brcmf_bus *bus = dev_get_drvdata(dev);
 	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
 
+	if (brcmf_pcie_is_4398(devinfo) && brcmf_warm_pm)
+		return brcmf_pcie_warm_resume(dev);
 	if (!brcmf_pcie_cold_pm(devinfo))
 		return brcmf_pcie_pm_leave_D3(dev);
 	return 0;	/* stays down until wlan_power 1 */
