@@ -27,6 +27,7 @@
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of.h>
 
@@ -43,11 +44,20 @@
 #define HK3_BRIGHTNESS_MAX	4095
 #define HK3_BRIGHTNESS_DEFAULT	1353	/* vendor dft_brightness, ~140 nits */
 
+/*
+ * Minimum time between sleep-in (0x10) and the next sleep-out (0x11). DCS
+ * asks for >= 120 ms; a quick screen off -> on that woke the DDIC sooner left
+ * it with wrong (green, oversaturated) colours until the next reboot. The
+ * screen does not need to come back faster than this, so keep a wide margin.
+ */
+#define HK3_SLEEP_IN_MIN_MS	500
+
 struct hk3_panel {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi;
 	struct gpio_desc *reset_gpio;
 	bool asleep;	/* set by disable(): the next enable() must sleep-out */
+	ktime_t sleep_in_time;	/* boottime when disable() sent sleep-in */
 };
 
 static inline struct hk3_panel *to_hk3_panel(struct drm_panel *panel)
@@ -134,26 +144,41 @@ static int hk3_panel_enable(struct drm_panel *panel)
 	struct drm_dsc_picture_parameter_set pps;
 	int ret;
 
-	dev_info(&dsi->dev, "enable (asleep=%d)\n", ctx->asleep);
-
 	if (ctx->asleep) {
-		mipi_dsi_dcs_exit_sleep_mode(dsi);
+		s64 since = ktime_ms_delta(ktime_get_boottime(), ctx->sleep_in_time);
+
+		dev_info(&dsi->dev, "enable: asleep for %lld ms\n", since);
+		if (since < HK3_SLEEP_IN_MIN_MS)
+			msleep(HK3_SLEEP_IN_MIN_MS - since);
+
+		ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
+		if (ret < 0)
+			dev_err(&dsi->dev, "sleep-out failed: %d\n", ret);
 		msleep(120);
 		ctx->asleep = false;
+	} else {
+		dev_info(&dsi->dev, "enable (awake)\n");
 	}
 
 	/* DSC: enable + PPS (vendor hk3_enable "pps" block) */
-	hk3_dcs(dsi, 0x9D, 0x01);
+	ret = hk3_dcs(dsi, 0x9D, 0x01);
+	if (ret < 0)
+		dev_err(&dsi->dev, "DSC enable failed: %d\n", ret);
 	drm_dsc_pps_payload_pack(&pps, &hk3_wqhd_dsc);
 	ret = mipi_dsi_picture_parameter_set(dsi, &pps);
 	if (ret < 0)
 		dev_err(&dsi->dev, "failed to send DSC PPS: %d\n", ret);
 
 	/* image size (0x0C = WQHD) and 8-bit depth (0x01) selectors */
-	hk3_dcs(dsi, 0xF0, 0x5A, 0x5A);		/* unlock */
-	hk3_dcs(dsi, 0xC3, 0x0C);
-	hk3_dcs(dsi, 0xB0, 0x00, 0x01, 0xF2);
-	hk3_dcs(dsi, 0xF2, 0x01);
+	ret = hk3_dcs(dsi, 0xF0, 0x5A, 0x5A);		/* unlock */
+	if (ret >= 0)
+		ret = hk3_dcs(dsi, 0xC3, 0x0C);
+	if (ret >= 0)
+		ret = hk3_dcs(dsi, 0xB0, 0x00, 0x01, 0xF2);
+	if (ret >= 0)
+		ret = hk3_dcs(dsi, 0xF2, 0x01);
+	if (ret < 0)
+		dev_err(&dsi->dev, "C3/F2 selector write failed: %d\n", ret);
 	hk3_dcs(dsi, 0xF0, 0xA5, 0xA5);		/* lock */
 
 	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
@@ -170,10 +195,16 @@ static int hk3_panel_enable(struct drm_panel *panel)
 static int hk3_panel_disable(struct drm_panel *panel)
 {
 	struct hk3_panel *ctx = to_hk3_panel(panel);
+	int ret;
 
 	dev_info(&ctx->dsi->dev, "disable\n");
-	mipi_dsi_dcs_set_display_off(ctx->dsi);
-	mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
+	ret = mipi_dsi_dcs_set_display_off(ctx->dsi);
+	if (ret < 0)
+		dev_err(&ctx->dsi->dev, "display off failed: %d\n", ret);
+	ret = mipi_dsi_dcs_enter_sleep_mode(ctx->dsi);
+	if (ret < 0)
+		dev_err(&ctx->dsi->dev, "sleep-in failed: %d\n", ret);
+	ctx->sleep_in_time = ktime_get_boottime();
 	ctx->asleep = true;
 	return 0;
 }
